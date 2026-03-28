@@ -10321,6 +10321,17 @@ async function enterFixesMode(cbtis, filename) {
           fxNextId = Math.max(fxNextId, fx.id + 1);
           fxFixes.push(fx);
         }
+        // Restore brush settings
+        if (st.brushFeather != null) fxBrushFeather = st.brushFeather;
+        if (st.brushFlow != null) fxBrushFlow = st.brushFlow;
+        const fsl = document.getElementById('fxFeatherSlider');
+        if (fsl) fsl.value = Math.round(fxBrushFeather * 100);
+        const fvl = document.getElementById('fxFeatherVal');
+        if (fvl) fvl.textContent = Math.round(fxBrushFeather * 100) + '%';
+        const flsl = document.getElementById('fxFlowSlider');
+        if (flsl) flsl.value = Math.round(fxBrushFlow * 100);
+        const flvl = document.getElementById('fxFlowVal');
+        if (flvl) flvl.textContent = Math.round(fxBrushFlow * 100) + '%';
         // Re-extract images for each fix
         await fxReloadFixImages();
         fxRenderLayerList();
@@ -10528,6 +10539,7 @@ function exitFixesMode() {
 function fxSaveState() {
   if (!fxCbtis || !fxFilename) return;
   const data = {
+    brushFeather: fxBrushFeather, brushFlow: fxBrushFlow,
     fixes: fxFixes.map(fx => ({
       id: fx.id, sourceId: fx.sourceId, group: fx.group || fxSourceGroup,
       selectionStrokes: fx.selectionStrokes,
