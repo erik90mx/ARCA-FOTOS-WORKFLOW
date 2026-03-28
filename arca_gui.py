@@ -3454,6 +3454,33 @@ def _fixes_composite_base_impl(cbtis, filename):
 
     canvas_w, canvas_h = new_w, new_h
 
+    # --- Expand canvas to fit shadows that extend beyond image bounds ---
+    shadow_expand_l, shadow_expand_t, shadow_expand_r, shadow_expand_b = 0, 0, 0, 0
+    for sp in sombras_list:
+        pts = sp.get("points", [])
+        if len(pts) < 3:
+            continue
+        feather = sp.get("feather", {})
+        mf = max(feather.get("top", 0), feather.get("bottom", 0),
+                 feather.get("left", 0), feather.get("right", 0))
+        pad = int(mf * 2 + 20)
+        for pt in pts:
+            px, py = pt.get("x", 0), pt.get("y", 0)
+            # Relative to image bounds (after rotation expansion)
+            if px - pad < -exp_ox:
+                shadow_expand_l = max(shadow_expand_l, int(-exp_ox - (px - pad)))
+            if py - pad < -exp_oy:
+                shadow_expand_t = max(shadow_expand_t, int(-exp_oy - (py - pad)))
+            if px + pad > new_w - exp_ox:
+                shadow_expand_r = max(shadow_expand_r, int((px + pad) - (new_w - exp_ox)))
+            if py + pad > new_h - exp_oy:
+                shadow_expand_b = max(shadow_expand_b, int((py + pad) - (new_h - exp_oy)))
+    if shadow_expand_l or shadow_expand_t or shadow_expand_r or shadow_expand_b:
+        canvas_w += shadow_expand_l + shadow_expand_r
+        canvas_h += shadow_expand_t + shadow_expand_b
+        exp_ox += shadow_expand_l
+        exp_oy += shadow_expand_t
+
     # --- Create composite canvas (transparent — no panorama, same as Sombras view) ---
     composite = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
 
@@ -3557,11 +3584,11 @@ def _fixes_composite_base_impl(cbtis, filename):
             np_pts = np.array(rounded, dtype=np.int32)
         else:
             np_pts = np.array(coords, dtype=np.int32)
-        # Tight bbox with padding for feather
+        # Tight bbox with padding for feather (allow negative coords for expansion)
         pad_f = int(mf * 2 + 10)
         xs = [p[0] for p in coords]; ys = [p[1] for p in coords]
-        bx1 = max(0, min(xs) - pad_f); by1 = max(0, min(ys) - pad_f)
-        bx2 = min(canvas_w, max(xs) + pad_f); by2 = min(canvas_h, max(ys) + pad_f)
+        bx1 = min(xs) - pad_f; by1 = min(ys) - pad_f
+        bx2 = max(xs) + pad_f; by2 = max(ys) + pad_f
         bw, bh = bx2 - bx1, by2 - by1
         if bw <= 0 or bh <= 0:
             return None, None
@@ -3595,12 +3622,12 @@ def _fixes_composite_base_impl(cbtis, filename):
             else:
                 shadows_above.append((img, pos))
 
-    # --- Composite: shadows below ---
+    # --- Composite: shadows below (offset for canvas expansion) ---
     for simg, (sx, sy) in shadows_below:
-        _paste(composite, simg, sx, sy)
+        _paste(composite, simg, sx + shadow_expand_l, sy + shadow_expand_t)
 
-    # --- Composite: cutout ---
-    _paste(composite, cut_pil, 0, 0)
+    # --- Composite: cutout (offset for canvas expansion) ---
+    _paste(composite, cut_pil, shadow_expand_l, shadow_expand_t)
 
     # --- Composite: borlas ---
     for bd in borlas_data:
@@ -3749,9 +3776,9 @@ def _fixes_composite_base_impl(cbtis, filename):
         paste_y = int(py) + dy
         _paste(composite, resized, paste_x, paste_y)
 
-    # --- Composite: shadows above ---
+    # --- Composite: shadows above (offset for canvas expansion) ---
     for simg, (sx, sy) in shadows_above:
-        _paste(composite, simg, sx, sy)
+        _paste(composite, simg, sx + shadow_expand_l, sy + shadow_expand_t)
 
     # Scale down if needed
     if composite.width > maxw:
@@ -9230,13 +9257,37 @@ function shSaveState() {
 
 async function shCaptureSnapshot() {
   if (!shCutImg || !shCbtis || !shFilename) return;
+  // Compute canvas expansion to include all shadows (with feather padding)
+  let minPx = 0, minPy = 0, maxPx = shImgW, maxPy = shImgH;
+  for (const p of shPolygons) {
+    if (p.points.length < 3) continue;
+    const feather = p.feather || {};
+    const mf = Math.max(feather.top || 0, feather.bottom || 0, feather.left || 0, feather.right || 0);
+    const pad = mf * 2 + 20;
+    for (const pt of p.points) {
+      if (pt.x - pad < minPx) minPx = pt.x - pad;
+      if (pt.y - pad < minPy) minPy = pt.y - pad;
+      if (pt.x + pad > maxPx) maxPx = pt.x + pad;
+      if (pt.y + pad > maxPy) maxPy = pt.y + pad;
+    }
+  }
+  const offX = Math.floor(Math.min(0, minPx));
+  const offY = Math.floor(Math.min(0, minPy));
+  const snapW = Math.ceil(Math.max(shImgW, maxPx) - offX);
+  const snapH = Math.ceil(Math.max(shImgH, maxPy) - offY);
+
   // Render at scale=1 on offscreen canvas (no checkerboard, no UI)
+  // We want: ox = -offX, oy = -offY  (image top-left at canvas offset)
+  // shDraw computes: ox = (cw - shImgW) / 2 + pvX
+  // So: pvX = -offX - (snapW - shImgW) / 2
   const origCanvas = shCanvas, origCtx = shCtx;
   const savedZoom = pvZoom, savedX = pvX, savedY = pvY;
   const oc = document.createElement('canvas');
-  oc.width = shImgW; oc.height = shImgH;
+  oc.width = snapW; oc.height = snapH;
   shCanvas = oc; shCtx = oc.getContext('2d');
-  pvZoom = 1; pvX = 0; pvY = 0;
+  pvZoom = 1;
+  pvX = -offX - (snapW - shImgW) / 2;
+  pvY = -offY - (snapH - shImgH) / 2;
   _shSnapshotMode = true;
   shDraw();
   _shSnapshotMode = false;
@@ -10306,7 +10357,7 @@ async function fxReloadFixImages() {
         body: JSON.stringify({
           photo_id: fx.sourceId, group: fx.group || fxSourceGroup,
           strokes: fx.selectionStrokes, fix_id: fx.id,
-          rotation: fx.rotation || 0
+          rotation: fx.srcRotation || fx.rotation || 0
         })
       });
       if (!res.ok) { fx._img = null; continue; }
@@ -10416,7 +10467,9 @@ function fxSaveState() {
     fixes: fxFixes.map(fx => ({
       id: fx.id, sourceId: fx.sourceId, group: fx.group || fxSourceGroup,
       selectionStrokes: fx.selectionStrokes,
-      x: fx.x, y: fx.y, rotation: fx.rotation || 0,
+      x: fx.x, y: fx.y,
+      rotation: fx.rotation || 0,
+      srcRotation: fx.srcRotation || 0,
       fxScale: fx.fxScale || 1.0,
       bboxW: fx.bboxW, bboxH: fx.bboxH,
       opacity: fx.opacity, visible: fx.visible,
@@ -10832,7 +10885,8 @@ async function fxConfirmExtraction() {
       sourceId: fxSubPhotoId,
       group: fxSourceGroup,
       selectionStrokes: [...fxSubStrokes],
-      rotation: fxSubRotation || 0,
+      srcRotation: fxSubRotation || 0,  // Remember for re-extraction (server needs it)
+      rotation: 0,  // Visual rotation on canvas starts at 0 (server already applied rotation)
       // Position: center of base image (user can move)
       x: fxImgW / 2,
       y: fxImgH / 2,
