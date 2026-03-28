@@ -10170,6 +10170,9 @@ let fxTool = 'move', fxAction = 'erase', fxBrushSize = 15;
 let fxDragging = null, fxRotating = null, fxScaling = null, fxDrawing = false;
 let fxCurStroke = null, fxLassoPoints = [];
 let fxUndoStack = [], fxRedoStack = [];
+let fxBrushFeather = 0.5, fxBrushFlow = 1.0;
+let fxLassoFreehand = false, fxLassoDownXY = null, fxDraggingNode = -1;
+let fxDblClickPending = false;
 // Sub-editor state
 let fxSubMode = false, fxSubImg = null, fxSubImgW = 1, fxSubImgH = 1;
 let fxSubStrokes = [], fxSubPhotoId = '', fxSubDrawing = false, fxSubCurStroke = null, fxSubLassoPoints = [];
@@ -10222,6 +10225,14 @@ async function enterFixesMode(cbtis, filename) {
       <input type="range" class="rf-size-slider" min="2" max="80" value="${fxBrushSize}"
         oninput="fxBrushSize=+this.value;document.getElementById('fxSizeVal').textContent=this.value">
       <span class="rf-size-label" id="fxSizeVal">${fxBrushSize}</span>
+      <label style="font-size:11px">Pluma:</label>
+      <input type="range" class="rf-size-slider" min="0" max="100" value="${Math.round(fxBrushFeather*100)}" style="width:40px"
+        oninput="fxBrushFeather=this.value/100;document.getElementById('fxFeatherVal').textContent=this.value+'%'">
+      <span class="rf-size-label" id="fxFeatherVal">${Math.round(fxBrushFeather*100)}%</span>
+      <label style="font-size:11px">Flujo:</label>
+      <input type="range" class="rf-size-slider" min="5" max="100" value="${Math.round(fxBrushFlow*100)}" style="width:40px"
+        oninput="fxBrushFlow=this.value/100;document.getElementById('fxFlowVal').textContent=this.value+'%'">
+      <span class="rf-size-label" id="fxFlowVal">${Math.round(fxBrushFlow*100)}%</span>
       <span class="rf-sep"></span>
       <button class="rf-btn" onclick="fxUndo()" title="Deshacer (Ctrl+Z)">&#8617;</button>
       <button class="rf-btn" onclick="fxRedo()" title="Rehacer (Ctrl+Y)">&#8618;</button>
@@ -10394,33 +10405,86 @@ function fxBuildWorkCanvas(fx) {
 }
 
 function fxApplyEditStroke(ctx, stroke, w, h, origImg) {
-  const tmpC = document.createElement('canvas');
-  tmpC.width = w; tmpC.height = h;
-  const tmpCtx = tmpC.getContext('2d');
-  tmpCtx.fillStyle = '#000';
-  fxDrawStrokePath(tmpCtx, stroke, w, h);
-  // Small feather
-  const feather = Math.max(0.8, Math.min(w, h) / 2000.0);
-  tmpCtx.filter = `blur(${feather}px)`;
-  tmpCtx.drawImage(tmpC, 0, 0);
-  tmpCtx.filter = 'none';
-  if (stroke.mode === 'erase') {
-    ctx.save();
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.drawImage(tmpC, 0, 0);
-    ctx.restore();
+  const feather = stroke.feather != null ? stroke.feather : 0.5;
+  const flow = stroke.flow != null ? stroke.flow : 1.0;
+
+  if (stroke.type === 'lasso') {
+    // Lasso: fill polygon with feather blur
+    const tmpC = document.createElement('canvas');
+    tmpC.width = w; tmpC.height = h;
+    const tmpCtx = tmpC.getContext('2d');
+    tmpCtx.fillStyle = '#000';
+    fxDrawStrokePath(tmpCtx, stroke, w, h);
+    // Apply feather blur (scale feather 0-1 to pixel radius)
+    const blurR = Math.max(0.5, feather * 30);
+    tmpCtx.filter = `blur(${blurR}px)`;
+    tmpCtx.drawImage(tmpC, 0, 0);
+    tmpCtx.filter = 'none';
+    if (stroke.mode === 'erase') {
+      ctx.save(); ctx.globalCompositeOperation = 'destination-out';
+      ctx.drawImage(tmpC, 0, 0); ctx.restore();
+    } else {
+      // Restore: mask original pixels through feathered shape
+      const panoC = document.createElement('canvas');
+      panoC.width = w; panoC.height = h;
+      const panoCtx = panoC.getContext('2d');
+      panoCtx.drawImage(origImg, 0, 0);
+      panoCtx.globalCompositeOperation = 'destination-in';
+      panoCtx.drawImage(tmpC, 0, 0);
+      ctx.save(); ctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(panoC, 0, 0); ctx.restore();
+    }
   } else {
-    // Restore: bring original pixels back through mask
-    const panoC = document.createElement('canvas');
-    panoC.width = w; panoC.height = h;
-    const panoCtx = panoC.getContext('2d');
-    panoCtx.drawImage(origImg, 0, 0);
-    panoCtx.globalCompositeOperation = 'destination-in';
-    panoCtx.drawImage(tmpC, 0, 0);
-    ctx.save();
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(panoC, 0, 0);
-    ctx.restore();
+    // Brush: Togas-style radial gradient (single accumulation canvas)
+    const radius = stroke.radius * Math.max(w, h);
+    const innerR = radius * (1 - feather);
+    const tmpC = document.createElement('canvas');
+    tmpC.width = w; tmpC.height = h;
+    const tmpCtx = tmpC.getContext('2d');
+
+    for (const p of stroke.points) {
+      const px = p.x * w, py = p.y * h;
+      if (feather > 0.01 && radius > 1) {
+        const grad = tmpCtx.createRadialGradient(px, py, Math.max(0.5, innerR), px, py, radius);
+        if (stroke.mode === 'erase') {
+          grad.addColorStop(0, `rgba(0,0,0,${flow})`);
+          grad.addColorStop(1, 'rgba(0,0,0,0)');
+        } else {
+          grad.addColorStop(0, `rgba(255,255,255,${flow})`);
+          grad.addColorStop(1, 'rgba(255,255,255,0)');
+        }
+        tmpCtx.fillStyle = grad;
+      } else {
+        tmpCtx.fillStyle = stroke.mode === 'erase'
+          ? `rgba(0,0,0,${flow})` : `rgba(255,255,255,${flow})`;
+      }
+      tmpCtx.beginPath(); tmpCtx.arc(px, py, radius, 0, Math.PI * 2); tmpCtx.fill();
+    }
+    // Connect points with lines for smooth strokes
+    if (stroke.points.length > 1) {
+      tmpCtx.lineWidth = radius * 2; tmpCtx.lineCap = 'round'; tmpCtx.lineJoin = 'round';
+      tmpCtx.strokeStyle = stroke.mode === 'erase'
+        ? `rgba(0,0,0,${flow})` : `rgba(255,255,255,${flow})`;
+      tmpCtx.beginPath();
+      tmpCtx.moveTo(stroke.points[0].x * w, stroke.points[0].y * h);
+      for (let i = 1; i < stroke.points.length; i++)
+        tmpCtx.lineTo(stroke.points[i].x * w, stroke.points[i].y * h);
+      tmpCtx.stroke();
+    }
+    // Apply accumulated mask
+    if (stroke.mode === 'erase') {
+      ctx.save(); ctx.globalCompositeOperation = 'destination-out';
+      ctx.drawImage(tmpC, 0, 0); ctx.restore();
+    } else {
+      const panoC = document.createElement('canvas');
+      panoC.width = w; panoC.height = h;
+      const panoCtx = panoC.getContext('2d');
+      panoCtx.drawImage(origImg, 0, 0);
+      panoCtx.globalCompositeOperation = 'destination-in';
+      panoCtx.drawImage(tmpC, 0, 0);
+      ctx.save(); ctx.globalCompositeOperation = 'source-over';
+      ctx.drawImage(panoC, 0, 0); ctx.restore();
+    }
   }
 }
 
@@ -11114,17 +11178,32 @@ function fxMouseDown(e) {
   const ny = (my - oyBase) / (fxImgH * s);
 
   if (fxTool === 'lasso') {
-    fxLassoPoints.push({ x: nx, y: ny });
-    fxDraw();
-    return;
+    // --- LASSO (Refine-style) ---
+    fxLassoFreehand = false;
+    // Check close on first node
+ if (fxLassoPoints.length >= 3) {
+      const first = fxLassoPoints[0];
+      const fx = first.x * fxImgW * s + oxBase;
+      const fy = first.y * fxImgH * s + oyBase;
+      if ((mx-fx)*(mx-fx) + (my-fy)*(my-fy) <= 144) {
+        // Close lasso → apply as edit stroke
+ const hitIdx = fxHitTestLassoNode(e);
+    if (hitIdx >= 0) {
+      fxDraggingNode = hitIdx;
+    } else {
+      fxLassoPoints.push({ x: nx, y: ny });
+      fxLassoDownXY = { cx: e.clientX, cy: e.clientY, t: Date.now() };
+    }
+    fxDraw(); return;
   }
-  // Brush edit
+  // --- BRUSH (Togas-style with feather/flow) ---
   fxSaveSnapshot();
   fxDrawing = true;
   fxCurStroke = {
     type: 'brush', mode: fxAction,
     points: [{ x: nx, y: ny }],
-    radius: fxBrushSize / Math.max(fxImgW, fxImgH)
+    radius: fxBrushSize / Math.max(fxImgW, fxImgH),
+    feather: fxBrushFeather, flow: fxBrushFlow
   };
   fxDraw();
 }
@@ -11199,6 +11278,54 @@ function fxMouseMove(e) {
     fx.y = (my - fxDragging.offY - oyBase) / s;
     fxDraw(); return;
   }
+  // Lasso node dragging
+  if (fxDraggingNode >= 0 && fxTool === 'lasso') {
+    const s = pvZoom;
+    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+    fxLassoPoints[fxDraggingNode] = { x: (mx - oxBase) / (fxImgW * s), y: (my - oyBase) / (fxImgH * s) };
+    fxDraw(); return;
+  }
+  // Lasso freehand (20px + 200ms threshold)
+  if (fxTool === 'lasso' && fxLassoDownXY && (e.buttons & 1) && fxSelected >= 0) {
+    if (!fxLassoFreehand) {
+      const ddx = e.clientX - fxLassoDownXY.cx;
+      const ddy = e.clientY - fxLassoDownXY.cy;
+      const elapsed = Date.now() - (fxLassoDownXY.t || 0);
+      if (ddx*ddx + ddy*ddy < 400 || elapsed < 200) return;
+      fxLassoFreehand = true;
+    }
+    const s = pvZoom;
+    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+    const nx = (mx - oxBase) / (fxImgW * s);
+    const ny = (my - oyBase) / (fxImgH * s);
+    const last = fxLassoPoints[fxLassoPoints.length - 1];
+    const dx = (nx - last.x) * fxImgW, dy = (ny - last.y) * fxImgH;
+    if (dx*dx + dy*dy > 9) { fxLassoPoints.push({ x: nx, y: ny }); fxDraw(); }
+    return;
+  }
+  // Lasso hover cursor
+  if (fxTool === 'lasso' && fxLassoPoints.length > 0 && fxSelected >= 0) {
+    const s = pvZoom;
+    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+    let cursor = 'crosshair';
+    // Check proximity to first node
+    if (fxLassoPoints.length >= 3) {
+      const f = fxLassoPoints[0];
+      const fsx = f.x * fxImgW * s + oxBase, fsy = f.y * fxImgH * s + oyBase;
+      if ((mx-fsx)*(mx-fsx) + (my-fsy)*(my-fsy) <= 144) cursor = 'pointer';
+    }
+    // Check node proximity
+    if (cursor === 'crosshair') {
+      for (const p of fxLassoPoints) {
+        const sx = p.x * fxImgW * s + oxBase, sy = p.y * fxImgH * s + oyBase;
+        if ((mx-sx)*(mx-sx) + (my-sy)*(my-sy) <= 64) { cursor = 'move'; break; }
+      }
+    }
+    e.target.style.cursor = cursor;
+  }
   // Brush edit drag
   if (fxDrawing && fxCurStroke) {
     const s = pvZoom;
@@ -11217,6 +11344,14 @@ function fxMouseUp(e) {
   if (fxScaling) { fxScaling = null; fxSaveState(); fxDraw(); return; }
   if (fxDragging) { fxDragging = null; fxSaveState(); fxDraw(); return; }
 
+  // Lasso node drag stop
+  if (fxDraggingNode >= 0) { fxDraggingNode = -1; fxDraw(); return; }
+  // Lasso freehand stop (keep points, don't close)
+  if (fxTool === 'lasso' && fxLassoDownXY) {
+    fxLassoDownXY = null; fxLassoFreehand = false;
+    fxDraw(); return;
+  }
+
   // Sub-editor brush up
   if (fxSubMode && fxSubDrawing && fxSubCurStroke) {
     fxSubStrokes.push(fxSubCurStroke);
@@ -11234,6 +11369,23 @@ function fxMouseUp(e) {
     fxDraw(); fxSaveState();
   }
 }
+
+function fxHitTestLassoNode(e) {
+  if (fxLassoPoints.length === 0) return -1;
+  const rect = fxCanvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const s = pvZoom;
+  const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+  const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+  for (let i = 0; i < fxLassoPoints.length; i++) {
+    const sx = fxLassoPoints[i].x * fxImgW * s + oxBase;
+    const sy = fxLassoPoints[i].y * fxImgH * s + oyBase;
+    if ((mx-sx)*(mx-sx) + (my-sy)*(my-sy) <= 64) return i;
+  }
+  return -1;
+}
+
+ }
 
 function fxDblClick(e) {
   // Close lasso in sub-editor
