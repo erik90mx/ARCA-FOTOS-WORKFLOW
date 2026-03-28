@@ -1,0 +1,29 @@
+# Virtual environments
+gui_venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large data files
+*.tiff
+*.tif
+
+# Generated photo data
+2026/
+
+# Models (large binary files)
+models/
+
+# Background removal tool
+remover_fondo/
+
+# Zone identifier files (Windows)
+*:Zone.Identifier
+
+# Snapshot files (generated at runtime)
+.*.sombras_snapshot.webp
+
+# Claude project config
+.claude/
