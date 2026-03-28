@@ -9188,6 +9188,8 @@ async function enterSombrasMode(cbtis, filename) {
       }
       shRenderList();
       shDraw();
+      // Auto-capture snapshot for Fixes section (after all images are loaded)
+      shCaptureSnapshot();
     });
   }, 50);
 }
@@ -10225,6 +10227,7 @@ async function enterFixesMode(cbtis, filename) {
     try {
       const snapUrl = `/api/sombras/snapshot/${cbtis}/${encName}?maxw=600`;
       let testRes = await fetch(snapUrl);
+      let usedSnapshot = testRes.ok;
       if (!testRes.ok) {
         // Fallback to server-rendered composite
         console.warn('[FX] No snapshot, falling back to server composite');
@@ -10234,6 +10237,7 @@ async function enterFixesMode(cbtis, filename) {
           showToast('Error: guarda el estado en Sombras primero', 'error');
           return;
         }
+        showToast('Tip: ve a Sombras y guarda para mejor calidad', 'warn');
       }
       const blob = await testRes.blob();
       const blobUrl = URL.createObjectURL(blob);
@@ -10311,9 +10315,12 @@ async function fxReloadFixImages() {
       fx._img = await loadImg(URL.createObjectURL(blob));
       if (bboxHeader) {
         fx._bbox = JSON.parse(bboxHeader);
-        // Update bbox display dimensions
-        fx.bboxW = fx._bbox.w * fxImgW;
-        fx.bboxH = fx._bbox.h * fxImgH;
+        // Re-compute display dimensions using source-to-base scale
+        const srcW = fx._bbox.src_w || 1;
+        const srcToBase = Math.min(fxImgW / srcW, fxImgH / (fx._bbox.src_h || 1));
+        fx.fxScale = fx.fxScale || 1.0;
+        fx.bboxW = (fx._bbox.pw || fx._img.width) * srcToBase;
+        fx.bboxH = (fx._bbox.ph || fx._img.height) * srcToBase;
       }
       fx._workCanvas = fxBuildWorkCanvas(fx);
     } catch { fx._img = null; }
@@ -10613,10 +10620,13 @@ function fxDraw() {
       if (!fx.visible || !fx._workCanvas) continue;
       ctx.save();
       ctx.globalAlpha = fx.opacity;
-      // Draw the fix at its correct size relative to the base image
+      // bboxW/bboxH are already in base image pixel coords
+      // fxScale is user's manual scale adjustment (1.0 = original)
       const fxS = fx.fxScale || 1.0;
-      const drawW = (fx.bboxW || fx._workCanvas.width) * fxS * s;
-      const drawH = (fx.bboxH || fx._workCanvas.height) * fxS * s;
+      const bw = fx.bboxW || fx._workCanvas.width;
+      const bh = fx.bboxH || fx._workCanvas.height;
+      const drawW = bw * fxS * s;
+      const drawH = bh * fxS * s;
       const fsx = ox + fx.x * s;
       const fsy = oy + fx.y * s;
       ctx.translate(fsx, fsy);
@@ -10810,22 +10820,27 @@ async function fxConfirmExtraction() {
     const img = await loadImg(URL.createObjectURL(blob));
     const bbox = bboxHeader ? JSON.parse(bboxHeader) : { x: 0.3, y: 0.3, w: 0.4, h: 0.4 };
 
-    // Create fix layer — position at bbox center on base image
-    // bbox.x/y/w/h are normalized (0-1) relative to source photo
-    // We map them to base image coordinates
+    // Create fix layer — position at center of base image for user to place
+    // bbox.px/py/pw/ph are pixel coords on source photo
+    // We map the extraction size to base image coordinates
+    const srcW = bbox.src_w || 1;
+    const srcH = bbox.src_h || 1;
+    // Scale factor: map source photo pixels to base image pixels
+    const srcToBase = Math.min(fxImgW / srcW, fxImgH / srcH);
     const fx = {
       id: fixId,
       sourceId: fxSubPhotoId,
       group: fxSourceGroup,
       selectionStrokes: [...fxSubStrokes],
       rotation: fxSubRotation || 0,
-      // Position: center of bbox mapped to base image coords
-      x: (bbox.x + bbox.w / 2) * fxImgW,
-      y: (bbox.y + bbox.h / 2) * fxImgH,
-      // Scale: bbox pixel size relative to base image
+      // Position: center of base image (user can move)
+      x: fxImgW / 2,
+      y: fxImgH / 2,
+      // fxScale is user's manual scale (1.0 = natural mapped size)
       fxScale: 1.0,
-      bboxW: bbox.w * fxImgW,  // width in base image pixels
-      bboxH: bbox.h * fxImgH,  // height in base image pixels
+      // Drawing size in base image pixel coords (already mapped)
+      bboxW: (bbox.pw || img.width) * srcToBase,
+      bboxH: (bbox.ph || img.height) * srcToBase,
       opacity: 1.0,
       visible: true,
       editStrokes: [],
