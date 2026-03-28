@@ -11193,13 +11193,25 @@ function fxMouseDown(e) {
     // --- LASSO (Refine-style) ---
     fxLassoFreehand = false;
     // Check close on first node
- if (fxLassoPoints.length >= 3) {
+    if (fxLassoPoints.length >= 3) {
       const first = fxLassoPoints[0];
-      const fx = first.x * fxImgW * s + oxBase;
-      const fy = first.y * fxImgH * s + oyBase;
-      if ((mx-fx)*(mx-fx) + (my-fy)*(my-fy) <= 144) {
+      const fsx = first.x * fxImgW * s + oxBase;
+      const fsy = first.y * fxImgH * s + oyBase;
+      if ((mx-fsx)*(mx-fsx) + (my-fsy)*(my-fsy) <= 144) {
         // Close lasso → apply as edit stroke
- const hitIdx = fxHitTestLassoNode(e);
+        fxSaveSnapshot();
+        const stroke = { type: 'lasso', mode: fxAction, points: [...fxLassoPoints], radius: 0, feather: fxBrushFeather, flow: fxBrushFlow };
+        const fix = fxFixes[fxSelected];
+        if (!fix.editStrokes) fix.editStrokes = [];
+        fix.editStrokes.push(stroke);
+        fix._workCanvas = fxBuildWorkCanvas(fix);
+        fxLassoPoints = [];
+        fxDraw(); fxSaveState();
+        return;
+      }
+    }
+    // Check hit on existing node → drag
+    const hitIdx = fxHitTestLassoNode(e);
     if (hitIdx >= 0) {
       fxDraggingNode = hitIdx;
     } else {
@@ -11396,8 +11408,6 @@ function fxHitTestLassoNode(e) {
   }
   return -1;
 }
-
- }
 
 function fxDblClick(e) {
   // Close lasso in sub-editor
