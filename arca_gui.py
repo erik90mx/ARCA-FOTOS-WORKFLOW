@@ -10194,6 +10194,48 @@ function fxScreenToImg(sx, sy) {
   return { x: (sx - ox) / s, y: (sy - oy) / s };
 }
 
+// Convert screen coords to local coords of selected fix layer (0-1 normalized)
+function fxScreenToFixLocal(sx, sy) {
+  const s = pvZoom;
+  const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+  const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+  const nx = (sx - oxBase) / (fxImgW * s);
+  const ny = (sy - oyBase) / (fxImgH * s);
+  if (fxSelected < 0 || fxSelected >= fxFixes.length) return null;
+  const fix = fxFixes[fxSelected];
+  const fxS = fix.fxScale || 1.0;
+  const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
+  const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
+  const drawW = bw * fxS;
+  const drawH = bh * fxS;
+  const rot = (fix.rotation || 0) * Math.PI / 180;
+  const dx = (nx - fix.x / fxImgW) * fxImgW;
+  const dy = (ny - fix.y / fxImgH) * fxImgH;
+  const rdx = dx * Math.cos(-rot) - dy * Math.sin(-rot);
+  const rdy = dx * Math.sin(-rot) + dy * Math.cos(-rot);
+  return { x: (rdx + drawW / 2) / drawW, y: (rdy + drawH / 2) / drawH };
+}
+
+// Convert fix-local coords (0-1) to screen coords
+function fxLocalToScreen(lx, ly) {
+  if (fxSelected < 0 || fxSelected >= fxFixes.length) return { x: 0, y: 0 };
+  const fix = fxFixes[fxSelected];
+  const s = pvZoom;
+  const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+  const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+  const fxS = fix.fxScale || 1.0;
+  const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
+  const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
+  const drawW = bw * fxS;
+  const drawH = bh * fxS;
+  const rot = (fix.rotation || 0) * Math.PI / 180;
+  const rdx = (lx - 0.5) * drawW;
+  const rdy = (ly - 0.5) * drawH;
+  const dx = rdx * Math.cos(rot) - rdy * Math.sin(rot);
+  const dy = rdx * Math.sin(rot) + rdy * Math.cos(rot);
+  return { x: oxBase + (fix.x + dx) * s, y: oyBase + (fix.y + dy) * s };
+}
+
 async function enterFixesMode(cbtis, filename) {
   // Exit any other mode
   if (rfMode) await exitRefineMode();
@@ -10772,12 +10814,71 @@ function fxDraw() {
     }
     // In-progress edit stroke on selected fix
     if (fxCurStroke && fxSelected >= 0) {
+      const fix = fxFixes[fxSelected];
       ctx.save();
       ctx.globalAlpha = 0.4;
       ctx.fillStyle = fxAction === 'erase' ? 'rgba(255,80,80,0.5)' : 'rgba(80,255,80,0.5)';
       ctx.strokeStyle = ctx.fillStyle;
-      fxDrawStrokeOnCanvas(ctx, fxCurStroke, ox, oy, s, fxImgW, fxImgH);
+      if (fxCurStroke.local && fix) {
+        // Draw in fix layer's transformed space
+        const fxS = fix.fxScale || 1.0;
+        const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
+        const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
+        const drawW = bw * fxS, drawH = bh * fxS;
+        const fsx = ox + fix.x * s, fsy = oy + fix.y * s;
+        ctx.translate(fsx, fsy);
+        if (fix.rotation) ctx.rotate(fix.rotation * Math.PI / 180);
+        // Draw stroke points in local coords (0-1)
+        const pts = fxCurStroke.points;
+        const r = fxCurStroke.radius * Math.max(drawW, drawH);
+        if (fxCurStroke.type === 'lasso' && pts.length > 0) {
+          ctx.beginPath();
+          ctx.moveTo(-drawW/2 + pts[0].x * drawW, -drawH/2 + pts[0].y * drawH);
+          for (let i = 1; i < pts.length; i++)
+            ctx.lineTo(-drawW/2 + pts[i].x * drawW, -drawH/2 + pts[i].y * drawH);
+          ctx.stroke();
+        } else if (pts.length > 0) {
+          for (const p of pts) {
+            ctx.beginPath(); ctx.arc(-drawW/2 + p.x * drawW, -drawH/2 + p.y * drawH, r, 0, Math.PI * 2); ctx.fill();
+          }
+        }
+      } else {
+        fxDrawStrokeOnCanvas(ctx, fxCurStroke, ox, oy, s, fxImgW, fxImgH);
+      }
       ctx.restore();
+    }
+    // In-progress lasso (main mode) — draw in fix layer space
+    if (fxTool === 'lasso' && fxLassoPoints.length > 0 && fxSelected >= 0) {
+      const fix = fxFixes[fxSelected];
+      if (fix) {
+        const fxS = fix.fxScale || 1.0;
+        const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
+        const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
+        const drawW = bw * fxS, drawH = bh * fxS;
+        const fsx = ox + fix.x * s, fsy = oy + fix.y * s;
+        const lassoColor = fxAction === 'restore' ? 'rgba(158,206,106' : 'rgba(247,118,142';
+        ctx.save();
+        ctx.translate(fsx, fsy);
+        if (fix.rotation) ctx.rotate(fix.rotation * Math.PI / 180);
+        ctx.strokeStyle = lassoColor + ',0.8)';
+        ctx.lineWidth = 2 / s; ctx.setLineDash([6/s, 4/s]);
+        ctx.beginPath();
+        ctx.moveTo(-drawW/2 + fxLassoPoints[0].x * drawW, -drawH/2 + fxLassoPoints[0].y * drawH);
+        for (let i = 1; i < fxLassoPoints.length; i++)
+          ctx.lineTo(-drawW/2 + fxLassoPoints[i].x * drawW, -drawH/2 + fxLassoPoints[i].y * drawH);
+        ctx.stroke(); ctx.setLineDash([]);
+        // Nodes
+        const nodeR = 5 / s;
+        for (let i = 0; i < fxLassoPoints.length; i++) {
+          const px = -drawW/2 + fxLassoPoints[i].x * drawW;
+          const py = -drawH/2 + fxLassoPoints[i].y * drawH;
+          const isFirst = (i === 0 && fxLassoPoints.length >= 3);
+          ctx.beginPath(); ctx.arc(px, py, isFirst ? nodeR * 1.6 : nodeR, 0, Math.PI * 2);
+          ctx.fillStyle = isFirst ? 'rgba(255,255,100,0.95)' : lassoColor + ',0.9)';
+          ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5/s; ctx.stroke();
+        }
+        ctx.restore();
+      }
     }
   }
 }
@@ -11189,19 +11290,47 @@ function fxMouseDown(e) {
   const nx = (mx - oxBase) / (fxImgW * s);
   const ny = (my - oyBase) / (fxImgH * s);
 
+  // Convert base-image coords to fix-layer local coords
+  const fix = fxFixes[fxSelected];
+  const fxS = fix.fxScale || 1.0;
+  const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
+  const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
+  const drawW = bw * fxS;
+  const drawH = bh * fxS;
+  const rot = (fix.rotation || 0) * Math.PI / 180;
+  // Mouse in base image pixels relative to fix center
+  const dx = (nx - fix.x / fxImgW) * fxImgW;
+  const dy = (ny - fix.y / fxImgH) * fxImgH;
+  // Un-rotate
+  const rdx = dx * Math.cos(-rot) - dy * Math.sin(-rot);
+  const rdy = dx * Math.sin(-rot) + dy * Math.cos(-rot);
+  // Scale to work canvas
+  const wkW = fix._workCanvas ? fix._workCanvas.width : bw;
+  const wkH = fix._workCanvas ? fix._workCanvas.height : bh;
+  const lx = (rdx + drawW / 2) / drawW;
+  const ly = (rdy + drawH / 2) / drawH;
+  if (lx < -0.1 || ly < -0.1 || lx > 1.1 || ly > 1.1) return;
+
   if (fxTool === 'lasso') {
     // --- LASSO (Refine-style) ---
     fxLassoFreehand = false;
     // Check close on first node
     if (fxLassoPoints.length >= 3) {
       const first = fxLassoPoints[0];
-      const fsx = first.x * fxImgW * s + oxBase;
-      const fsy = first.y * fxImgH * s + oyBase;
-      if ((mx-fsx)*(mx-fsx) + (my-fsy)*(my-fsy) <= 144) {
+      // First node in screen coords for hit test
+      const fsx = oxBase + fix.x * s + (first.x * drawW - drawW / 2) * Math.cos(rot) * s / drawW * fxImgW;
+      const fsy = oyBase + fix.y * s;
+      // Simple proximity test: reproject first node to screen
+      const fDx = (first.x - 0.5) * drawW;
+      const fDy = (first.y - 0.5) * drawH;
+      const fSx = fDx * Math.cos(rot) - fDy * Math.sin(rot);
+      const fSy = fDx * Math.sin(rot) + fDy * Math.cos(rot);
+      const fsxS = oxBase + (fix.x + fSx / fxImgW) * s;
+      const fsyS = oyBase + (fix.y + fSy / fxImgH) * s;
+      if ((mx-fsxS)*(mx-fsxS) + (my-fsyS)*(my-fsyS) <= 144) {
         // Close lasso → apply as edit stroke
         fxSaveSnapshot();
-        const stroke = { type: 'lasso', mode: fxAction, points: [...fxLassoPoints], radius: 0, feather: fxBrushFeather, flow: fxBrushFlow };
-        const fix = fxFixes[fxSelected];
+        const stroke = { type: 'lasso', mode: fxAction, points: [...fxLassoPoints], radius: 0, feather: fxBrushFeather, flow: fxBrushFlow, local: true };
         if (!fix.editStrokes) fix.editStrokes = [];
         fix.editStrokes.push(stroke);
         fix._workCanvas = fxBuildWorkCanvas(fix);
@@ -11215,7 +11344,7 @@ function fxMouseDown(e) {
     if (hitIdx >= 0) {
       fxDraggingNode = hitIdx;
     } else {
-      fxLassoPoints.push({ x: nx, y: ny });
+      fxLassoPoints.push({ x: lx, y: ly });
       fxLassoDownXY = { cx: e.clientX, cy: e.clientY, t: Date.now() };
     }
     fxDraw(); return;
@@ -11225,9 +11354,9 @@ function fxMouseDown(e) {
   fxDrawing = true;
   fxCurStroke = {
     type: 'brush', mode: fxAction,
-    points: [{ x: nx, y: ny }],
-    radius: fxBrushSize / Math.max(fxImgW, fxImgH),
-    feather: fxBrushFeather, flow: fxBrushFlow
+    points: [{ x: lx, y: ly }],
+    radius: fxBrushSize / Math.max(drawW, drawH),
+    feather: fxBrushFeather, flow: fxBrushFlow, local: true
   };
   fxDraw();
 }
@@ -11307,7 +11436,8 @@ function fxMouseMove(e) {
     const s = pvZoom;
     const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
     const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
-    fxLassoPoints[fxDraggingNode] = { x: (mx - oxBase) / (fxImgW * s), y: (my - oyBase) / (fxImgH * s) };
+    const local = fxScreenToFixLocal(mx, my);
+    if (local) fxLassoPoints[fxDraggingNode] = { x: local.x, y: local.y };
     fxDraw(); return;
   }
   // Lasso freehand (20px + 200ms threshold)
@@ -11319,27 +11449,21 @@ function fxMouseMove(e) {
       if (ddx*ddx + ddy*ddy < 400 || elapsed < 200) return;
       fxLassoFreehand = true;
     }
-    const s = pvZoom;
-    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
-    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
-    const nx = (mx - oxBase) / (fxImgW * s);
-    const ny = (my - oyBase) / (fxImgH * s);
+    const local = fxScreenToFixLocal(mx, my);
+    if (!local) return;
     const last = fxLassoPoints[fxLassoPoints.length - 1];
-    const dx = (nx - last.x) * fxImgW, dy = (ny - last.y) * fxImgH;
-    if (dx*dx + dy*dy > 9) { fxLassoPoints.push({ x: nx, y: ny }); fxDraw(); }
+    const dx = local.x - last.x, dy = local.y - last.y;
+    if (dx*dx + dy*dy > 0.0003) { fxLassoPoints.push({ x: local.x, y: local.y }); fxDraw(); }
     return;
   }
   // Lasso hover cursor
   if (fxTool === 'lasso' && fxLassoPoints.length > 0 && fxSelected >= 0) {
-    const s = pvZoom;
-    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
-    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
     let cursor = 'crosshair';
     // Check proximity to first node
     if (fxLassoPoints.length >= 3) {
       const f = fxLassoPoints[0];
-      const fsx = f.x * fxImgW * s + oxBase, fsy = f.y * fxImgH * s + oyBase;
-      if ((mx-fsx)*(mx-fsx) + (my-fsy)*(my-fsy) <= 144) cursor = 'pointer';
+      const scr = fxLocalToScreen(f.x, f.y);
+      if ((mx-scr.x)*(mx-scr.x) + (my-scr.y)*(my-scr.y) <= 144) cursor = 'pointer';
     }
     // Check node proximity
     if (cursor === 'crosshair') {
@@ -11353,11 +11477,9 @@ function fxMouseMove(e) {
   // Brush edit drag
   if (fxDrawing && fxCurStroke) {
     const s = pvZoom;
-    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
-    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
-    const nx = (mx - oxBase) / (fxImgW * s);
-    const ny = (my - oyBase) / (fxImgH * s);
-    fxCurStroke.points.push({ x: nx, y: ny });
+    const local = fxScreenToFixLocal(mx, my);
+    if (!local) return;
+    fxCurStroke.points.push({ x: local.x, y: local.y });
     fxDraw();
   }
 }
@@ -11395,16 +11517,12 @@ function fxMouseUp(e) {
 }
 
 function fxHitTestLassoNode(e) {
-  if (fxLassoPoints.length === 0) return -1;
+  if (fxLassoPoints.length === 0 || fxSelected < 0) return -1;
   const rect = fxCanvas.getBoundingClientRect();
   const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-  const s = pvZoom;
-  const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
-  const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
   for (let i = 0; i < fxLassoPoints.length; i++) {
-    const sx = fxLassoPoints[i].x * fxImgW * s + oxBase;
-    const sy = fxLassoPoints[i].y * fxImgH * s + oyBase;
-    if ((mx-sx)*(mx-sx) + (my-sy)*(my-sy) <= 64) return i;
+    const scr = fxLocalToScreen(fxLassoPoints[i].x, fxLassoPoints[i].y);
+    if ((mx-scr.x)*(mx-scr.x) + (my-scr.y)*(my-scr.y) <= 64) return i;
   }
   return -1;
 }
