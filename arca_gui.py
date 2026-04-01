@@ -2767,8 +2767,8 @@ def api_sombras_export_tiff(cbtis, filename):
         _tb.print_exc()
         return jsonify({"error": str(e)}), 500
 
-def _sombras_export_tiff_impl(cbtis, filename):
-    """Full TIFF export: pano + sombras-below + cutout + borlas + hilos + togas + sombras-above.
+def _sombras_export_tiff_impl(cbtis, filename, data_override=None):
+    """Full TIFF export: pano + sombras-below + cutout + borlas + hilos + togas + sombras-above + fixes.
     Reuses the same transform/rendering logic as the Togas TIFF export."""
     import tifffile
     import imagecodecs
@@ -2785,7 +2785,7 @@ def _sombras_export_tiff_impl(cbtis, filename):
         TiffImageSourceData, overlay,
     )
 
-    data = request.get_json(force=True)
+    data = data_override if data_override is not None else request.get_json(force=True)
     sombras_data = data.get("sombras", [])
     borlas_data = data.get("borlas", [])
     togas_data = data.get("togas", [])
@@ -3245,6 +3245,82 @@ def _sombras_export_tiff_impl(cbtis, filename):
             toga_comp.append((arr, (ly1, lx1)))
             toga_psd.append(_make_psd_layer(f'Toga {i+1}', arr, lx1, ly1))
 
+    # --- Fix layers (from Fixes section) ---
+    fixes_data = data.get("fixes", [])
+    fix_comp = []
+    fix_psd = []
+    comp_shadow = data.get("fixesShadowExpand", [0, 0])
+    fix_extra = data.get("fixesExtraOffset", [0, 0])
+    for fi, fd in enumerate(fixes_data):
+        try:
+            img_data_b64 = fd.get("imgData", "")
+            if not img_data_b64:
+                continue
+            # Decode base64 PNG/WebP from client workCanvas
+            if "," in img_data_b64:
+                img_data_b64 = img_data_b64.split(",", 1)[1]
+            fix_pil = Image.open(BytesIO(base64.b64decode(img_data_b64))).convert("RGBA")
+            # Target display size in base-image pixels
+            bbox_w = fd.get("bboxW", fix_pil.width)
+            bbox_h = fd.get("bboxH", fix_pil.height)
+            fx_scale = fd.get("fxScale", 1.0)
+            target_w = max(1, int(bbox_w * fx_scale))
+            target_h = max(1, int(bbox_h * fx_scale))
+            fix_resized = fix_pil.resize((target_w, target_h), Image.LANCZOS)
+            # Apply opacity
+            opacity = fd.get("opacity", 1.0)
+            if opacity < 0.999:
+                arr_tmp = np.array(fix_resized, dtype=np.float32)
+                arr_tmp[:, :, 3] *= opacity
+                fix_resized = Image.fromarray(np.clip(arr_tmp, 0, 255).astype(np.uint8))
+            # Apply fix rotation
+            fix_rot = fd.get("rotation", 0)
+            dx_fix, dy_fix = 0, 0
+            if abs(fix_rot) > 0.5:
+                bfw, bfh = fix_resized.size
+                pad_f = max(bfw, bfh)
+                padded_f = Image.new("RGBA", (bfw + pad_f * 2, bfh + pad_f * 2), (0, 0, 0, 0))
+                padded_f.paste(fix_resized, (pad_f, pad_f), fix_resized)
+                pivot_fx = pad_f + bfw // 2
+                pivot_fy = pad_f + bfh // 2
+                rotated_f = padded_f.rotate(-fix_rot, center=(pivot_fx, pivot_fy),
+                                            expand=False, resample=Image.BICUBIC)
+                bbox_f = rotated_f.getbbox()
+                if bbox_f:
+                    rotated_f = rotated_f.crop(bbox_f)
+                    dx_fix = bbox_f[0] - pad_f
+                    dy_fix = bbox_f[1] - pad_f
+                fix_resized = rotated_f
+            # Fix center position — fixes are in snapshot space where:
+            #   shadow expansion is relative to unrotated cutout, and
+            #   imgTf translation shifts the cutout visually.
+            # Map: tiff = fix - snap_shadow + pad + extra_offset
+            # where extra_offset = exp_ox - rotated(imgTf.x/y)
+            fcx_orig = fd.get("x", 0)
+            fcy_orig = fd.get("y", 0)
+            fcx_t = fcx_orig - comp_shadow[0] + pad_left + fix_extra[0]
+            fcy_t = fcy_orig - comp_shadow[1] + pad_top + fix_extra[1]
+            # Place centered at position
+            rfW, rfH = fix_resized.size
+            bx = int(fcx_t) - rfW // 2 + dx_fix
+            by = int(fcy_t) - rfH // 2 + dy_fix
+            # Clip to canvas
+            lx1 = max(0, bx)
+            ly1 = max(0, by)
+            lx2 = min(w, bx + rfW)
+            ly2 = min(h, by + rfH)
+            if lx2 <= lx1 or ly2 <= ly1:
+                continue
+            crop_x1 = lx1 - bx
+            crop_y1 = ly1 - by
+            cropped_fix = np.array(fix_resized, dtype=np.uint8)[
+                crop_y1:ly2 - ly1 + crop_y1, crop_x1:lx2 - lx1 + crop_x1]
+            fix_comp.append((cropped_fix, (ly1, lx1)))
+            fix_psd.append(_make_psd_layer(f'Fix {fd.get("id", fi) + 1}', cropped_fix, lx1, ly1))
+        except Exception as exc:
+            print(f"[TIFF] Fix layer {fi} error: {exc}")
+            continue
+
     # --- Build PSD layer stack (bottom-to-top) ---
     all_layers = [
         PsdLayer(
@@ -3283,6 +3359,8 @@ def _sombras_export_tiff_impl(cbtis, filename):
     _add_group(all_layers, hilo_psd, 'HILOS')
     _add_group(all_layers, toga_psd, 'TOGAS')
     _add_group(all_layers, shadow_above_psd, 'SOMBRAS ARRIBA')
+    if fix_psd:
+        _add_group(all_layers, fix_psd, 'FIXES')
 
     image_source_data = TiffImageSourceData(
         name='ARCA Export',
@@ -3302,6 +3380,7 @@ def _sombras_export_tiff_impl(cbtis, filename):
     for a in hilo_comp: comp_args.append(a)
     for a in toga_comp: comp_args.append(a)
     for a in shadow_above_rgba: comp_args.append(a)
+    for a in fix_comp: comp_args.append(a)
     composite = overlay(*comp_args, shape=(h, w))
 
     buf = BytesIO()
@@ -3320,6 +3399,168 @@ def _sombras_export_tiff_impl(cbtis, filename):
 
 
 # --- Fixes endpoints ---
+
+@app.route("/api/fixes/export-tiff/<cbtis>/<filename>", methods=["POST"])
+def api_fixes_export_tiff(cbtis, filename):
+    """Export TIFF with everything from Sombras PLUS fix layers on top.
+    Loads sombras/borlas/togas state from disk; receives fix image data from client."""
+    import traceback as _tb
+    try:
+        return _fixes_export_tiff_impl(cbtis, filename)
+    except Exception as e:
+        print(f"[FIXES TIFF EXPORT ERROR] {e}")
+        _tb.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+def _fixes_export_tiff_impl(cbtis, filename):
+    """Load all layer states from disk, combine with fix data from client, delegate to sombras export."""
+    year_dir = get_year_dir()
+    cut_path = year_dir / cbtis / "RECORTADAS" / filename
+    if not cut_path.exists():
+        return jsonify({"error": "Not found"}), 404
+
+    # Load saved states from disk (same as _fixes_composite_base_impl)
+    borlas_data, togas_data, sombras_list = [], [], []
+    img_tf = {}
+    toga_group_tf = {}
+    hilo_color_hex, hilo_size, hilo_feather, hilo_flow = "#d4a017", 3, 1, 100
+    toga_ref_ar = 1.5
+
+    borlas_sp = _borlas_state_path(cbtis, filename)
+    if borlas_sp.exists():
+        try:
+            with open(borlas_sp) as f:
+                bs = json.load(f)
+            borlas_data = [b for b in bs.get("borlas", []) if b.get("visible", True)]
+            hilo_color_hex = bs.get("hiloColor", "#d4a017")
+            hilo_size = bs.get("hiloSize", 3)
+            hilo_feather = bs.get("hiloFeather", 1)
+            hilo_flow = bs.get("hiloFlow", 100)
+        except Exception:
+            pass
+
+    togas_sp = _togas_state_path(cbtis, filename)
+    if togas_sp.exists():
+        try:
+            with open(togas_sp) as f:
+                ts = json.load(f)
+            togas_data = ts.get("togas", [])
+            toga_group_tf = ts.get("groupTf", {})
+            img_tf = ts.get("imgTf", {})
+            toga_ref_ar = ts.get("togaRefAR", 1.5)
+        except Exception:
+            pass
+
+    sombras_sp = _sombras_state_path(cbtis, filename)
+    if sombras_sp.exists():
+        try:
+            with open(sombras_sp) as f:
+                ss = json.load(f)
+            sombras_list = ss.get("polygons", [])
+        except Exception:
+            pass
+
+    # Get fixes from client POST
+    client_data = request.get_json(force=True) if request.data else {}
+    fixes_data = client_data.get("fixes", [])
+
+    import math as _m
+    with Image.open(str(cut_path)) as _im:
+        orig_w, orig_h = _im.size
+    img_cx, img_cy = orig_w / 2.0, orig_h / 2.0
+
+    # --- Pre-transform toga positions (same as JS shExportTiff) ---
+    # JS applies groupTf.x/y offset, rotates around image center by groupTf.rotation,
+    # adds groupTf.rotation to individual toga rotation, then sends only scaleY.
+    # We must replicate this since the server expects pre-transformed positions.
+    g_x = toga_group_tf.get("x", 0)
+    g_y = toga_group_tf.get("y", 0)
+    g_rot = toga_group_tf.get("rotation", 0)
+    g_rad = _m.radians(g_rot)
+    for td in togas_data:
+        px = td.get("x", 0) + g_x
+        py = td.get("y", 0) + g_y
+        if abs(g_rad) > 0.001:
+            dx, dy = px - img_cx, py - img_cy
+            px = img_cx + dx * _m.cos(g_rad) - dy * _m.sin(g_rad)
+            py = img_cy + dx * _m.sin(g_rad) + dy * _m.cos(g_rad)
+        td["x"] = round(px)
+        td["y"] = round(py)
+        td["rotation"] = (td.get("rotation", 0)) + g_rot
+
+    # --- Compute togaRefAR from actual toga images (same as sombras JS) ---
+    # The togas state doesn't save togaRefAR, so we must compute it here.
+    toga_ars = []
+    for td in togas_data:
+        variant = td.get("variant", "")
+        tpath = CAIDA_DIR / f"{variant}.webp"
+        if tpath.exists():
+            with Image.open(str(tpath)) as t_im:
+                toga_ars.append(t_im.height / t_im.width)
+    toga_ref_ar = sum(toga_ars) / len(toga_ars) if toga_ars else 1.5
+
+    # --- Compute fix coordinate mapping offsets ---
+    # Fix positions are in the SNAPSHOT coordinate space where:
+    #   - Shadow expansion is relative to the UNROTATED cutout bounds (matching JS)
+    #   - imgTf rotation+translation is applied as a canvas visual transform
+    # The TIFF has:
+    #   - The cutout PRE-ROTATED by PIL (adding exp_ox/exp_oy expansion)
+    #   - imgTf.x/y NOT applied to the cutout
+    # Mapping: fix_tiff = fix - snap_shadow + pad + exp_ox - rotated(imgTf.xy)
+    img_rot_val = img_tf.get("rotation", 0)
+    comp_exp_ox, comp_exp_oy = 0.0, 0.0
+    if abs(img_rot_val) > 0.1:
+        irad = _m.radians(img_rot_val)
+        cos_a, sin_a = abs(_m.cos(irad)), abs(_m.sin(irad))
+        comp_exp_ox = (_m.ceil(orig_w * cos_a + orig_h * sin_a) - orig_w) / 2.0
+        comp_exp_oy = (_m.ceil(orig_h * cos_a + orig_w * sin_a) - orig_h) / 2.0
+
+    # Snapshot shadow expansion: compare against 0 (unrotated cutout bounds),
+    # NOT against -exp_ox (rotated cutout bounds). Matches JS shSaveSnapshot.
+    snap_shadow_l, snap_shadow_t = 0, 0
+    for sp in sombras_list:
+        pts = sp.get("points", [])
+        if len(pts) < 3:
+            continue
+        feather = sp.get("feather", {})
+        mf = max(feather.get("top", 0), feather.get("bottom", 0),
+                 feather.get("left", 0), feather.get("right", 0))
+        pad_val = int(mf * 2 + 20)
+        for pt in pts:
+            px, py = pt.get("x", 0), pt.get("y", 0)
+            if px - pad_val < 0:
+                snap_shadow_l = max(snap_shadow_l, int(-(px - pad_val)))
+            if py - pad_val < 0:
+                snap_shadow_t = max(snap_shadow_t, int(-(py - pad_val)))
+
+    # Extra offset for rotation expansion + imgTf translation
+    irad_r = _m.radians(img_rot_val)
+    cos_r_f = _m.cos(irad_r)
+    sin_r_f = _m.sin(irad_r)
+    img_tx = img_tf.get("x", 0)
+    img_ty = img_tf.get("y", 0)
+    fix_extra_x = comp_exp_ox - cos_r_f * img_tx + sin_r_f * img_ty
+    fix_extra_y = comp_exp_oy - sin_r_f * img_tx - cos_r_f * img_ty
+
+    # Build combined payload for the shared export implementation
+    payload = {
+        "sombras": sombras_list,
+        "borlas": borlas_data,
+        "togas": togas_data,
+        "togaGroupTransform": {"scaleY": toga_group_tf.get("scaleY", 1.0)},
+        "imgTransform": img_tf,
+        "hiloColor": hilo_color_hex,
+        "hiloSize": hilo_size,
+        "hiloFeather": hilo_feather,
+        "hiloFlow": hilo_flow,
+        "togaRefAR": toga_ref_ar,
+        "fixes": fixes_data,
+        "fixesShadowExpand": [snap_shadow_l, snap_shadow_t],
+        "fixesExtraOffset": [fix_extra_x, fix_extra_y],
+    }
+    return _sombras_export_tiff_impl(cbtis, filename, data_override=payload)
+
 
 def _parse_source_photos(filename):
     """Parse panorama filename to extract source photo IDs and group name.
@@ -3344,9 +3585,16 @@ def api_fixes_source_photos(cbtis, filename):
     year_dir = get_year_dir()
     photos = []
     for pid in ids:
+        # Try common extensions (cameras may save as .jpg or .JPG)
+        found = False
         photo_name = f"IMG_{pid}.jpg"
-        photo_path = year_dir / cbtis / group / photo_name
-        photos.append({"id": pid, "name": photo_name, "exists": photo_path.exists()})
+        for ext in (".jpg", ".JPG", ".jpeg", ".JPEG"):
+            candidate = year_dir / cbtis / group / f"IMG_{pid}{ext}"
+            if candidate.exists():
+                photo_name = f"IMG_{pid}{ext}"
+                found = True
+                break
+        photos.append({"id": pid, "name": photo_name, "exists": found})
     return jsonify({"ok": True, "photos": photos, "group": group})
 
 
@@ -3355,6 +3603,13 @@ def api_fixes_source_image(cbtis, group, photo_id):
     """Serve a source photo, optionally scaled."""
     year_dir = get_year_dir()
     photo_path = year_dir / cbtis / group / f"IMG_{photo_id}.jpg"
+    if not photo_path.exists():
+        # Try alternate extensions (cameras may save as .JPG, .jpeg, etc.)
+        for ext in (".JPG", ".jpeg", ".JPEG"):
+            alt = year_dir / cbtis / group / f"IMG_{photo_id}{ext}"
+            if alt.exists():
+                photo_path = alt
+                break
     if not photo_path.exists():
         return jsonify({"error": "Not found"}), 404
     maxw = request.args.get("maxw", 99999, type=int)
@@ -3754,9 +4009,11 @@ def _fixes_composite_base_impl(cbtis, filename):
         rot_cy = img_cy + gy_tf
         px = rot_cx + rx
         py = rot_cy + ry
-        # Only add canvas expansion offset (NO imgTransform rotation/translation)
-        px += exp_ox
-        py += exp_oy
+        # Add canvas expansion offset + imgTransform translation (same as TIFF)
+        # The TIFF applies: toga -= rotate(imgTf.xy) + exp_ox
+        # This matches the Sombras view where imgTf translates the cutout group
+        px += exp_ox - cos_r * img_tx + sin_r * img_ty
+        py += exp_oy - sin_r * img_tx - cos_r * img_ty
         t_rot = td.get("rotation", 0) + g_rot
         # Uniform height: resize source to (width, width * uniform_ref_ar * scaleY)
         # Then _render_layer_pil scales to target_w=scale, preserving aspect ratio
@@ -3820,6 +4077,12 @@ def _fixes_extract_impl(cbtis, filename):
 
     year_dir = get_year_dir()
     photo_path = year_dir / cbtis / group / f"IMG_{photo_id}.jpg"
+    if not photo_path.exists():
+        for ext in (".JPG", ".jpeg", ".JPEG"):
+            alt = year_dir / cbtis / group / f"IMG_{photo_id}{ext}"
+            if alt.exists():
+                photo_path = alt
+                break
     if not photo_path.exists():
         return jsonify({"ok": False, "error": "Source photo not found"}), 404
 
@@ -10167,7 +10430,8 @@ let fxCanvas = null, fxCtx = null, fxCursorCanvas = null, fxCursorCtx = null;
 let fxSourcePhotos = [], fxSourceGroup = '';
 let fxFixes = [], fxSelected = -1, fxNextId = 0;
 let fxTool = 'move', fxAction = 'erase', fxBrushSize = 15;
-let fxDragging = null, fxRotating = null, fxScaling = null, fxDrawing = false;
+let fxDragging = null, fxRotating = null, fxScaling = null, fxDrawing = false, fxDraggingPivot = false;
+let fxShowPivot = true;  // Show/hide pivot crosshair on selected fix
 let fxCurStroke = null, fxLassoPoints = [];
 let fxUndoStack = [], fxRedoStack = [];
 let fxBrushFeather = 0.5, fxBrushFlow = 1.0;
@@ -10176,6 +10440,7 @@ let fxDblClickPending = false;
 // Sub-editor state
 let fxSubMode = false, fxSubImg = null, fxSubImgW = 1, fxSubImgH = 1;
 let fxSubStrokes = [], fxSubPhotoId = '', fxSubDrawing = false, fxSubCurStroke = null, fxSubLassoPoints = [];
+let fxSubWorkCanvas = null, fxSubSnapshot = null, fxSubDraggingNode = -1;
 let fxSubRotation = 0;  // Source photo rotation in degrees (0, 90, 180, 270)
 let fxSubRotations = {};  // Per-photo rotation memory: { photoId: degrees }
 
@@ -10194,45 +10459,59 @@ function fxScreenToImg(sx, sy) {
   return { x: (sx - ox) / s, y: (sy - oy) / s };
 }
 
-// Convert screen coords to local coords of selected fix layer (0-1 normalized)
+// Convert screen coords to work-canvas pixel coords of selected fix layer
+// Same model as tgBrushOnMask: screen → base pixels → delta from center → un-rotate → mask pixels
 function fxScreenToFixLocal(sx, sy) {
   const s = pvZoom;
   const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
   const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
-  const nx = (sx - oxBase) / (fxImgW * s);
-  const ny = (sy - oyBase) / (fxImgH * s);
+  // Step 1: screen → base image pixels
+  const bpx = (sx - oxBase) / s;
+  const bpy = (sy - oyBase) / s;
   if (fxSelected < 0 || fxSelected >= fxFixes.length) return null;
   const fix = fxFixes[fxSelected];
-  const fxS = fix.fxScale || 1.0;
-  const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
-  const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
-  const drawW = bw * fxS;
-  const drawH = bh * fxS;
+  if (!fix._workCanvas) return null;
+  // Step 2: delta from fix center (base image pixels)
+  const dx = bpx - fix.x;
+  const dy = bpy - fix.y;
+  // Step 3: un-rotate
   const rot = (fix.rotation || 0) * Math.PI / 180;
-  const dx = (nx - fix.x / fxImgW) * fxImgW;
-  const dy = (ny - fix.y / fxImgH) * fxImgH;
-  const rdx = dx * Math.cos(-rot) - dy * Math.sin(-rot);
-  const rdy = dx * Math.sin(-rot) + dy * Math.cos(-rot);
-  return { x: (rdx + drawW / 2) / drawW, y: (rdy + drawH / 2) / drawH };
+  const rx = dx * Math.cos(-rot) - dy * Math.sin(-rot);
+  const ry = dx * Math.sin(-rot) + dy * Math.cos(-rot);
+  // Step 4: base image pixels → work canvas pixels
+  // drawW/drawH = size in base image pixels, wkW/wkH = work canvas pixel size
+  const fxS = fix.fxScale || 1.0;
+  const bw = fix.bboxW || fix._workCanvas.width;
+  const bh = fix.bboxH || fix._workCanvas.height;
+  const drawW = bw * fxS, drawH = bh * fxS;
+  const wkW = fix._workCanvas.width, wkH = fix._workCanvas.height;
+  // rx ranges from -drawW/2 to +drawW/2 → map to 0..wkW
+  const localX = (rx + drawW / 2) / drawW * wkW;
+  const localY = (ry + drawH / 2) / drawH * wkH;
+  return { x: localX, y: localY };
 }
 
-// Convert fix-local coords (0-1) to screen coords
-function fxLocalToScreen(lx, ly) {
+// Convert work-canvas pixel coords to screen coords (inverse of fxScreenToFixLocal)
+function fxLocalToScreen(localX, localY) {
   if (fxSelected < 0 || fxSelected >= fxFixes.length) return { x: 0, y: 0 };
   const fix = fxFixes[fxSelected];
+  if (!fix._workCanvas) return { x: 0, y: 0 };
   const s = pvZoom;
   const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
   const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
   const fxS = fix.fxScale || 1.0;
-  const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
-  const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
-  const drawW = bw * fxS;
-  const drawH = bh * fxS;
+  const bw = fix.bboxW || fix._workCanvas.width;
+  const bh = fix.bboxH || fix._workCanvas.height;
+  const drawW = bw * fxS, drawH = bh * fxS;
+  const wkW = fix._workCanvas.width, wkH = fix._workCanvas.height;
   const rot = (fix.rotation || 0) * Math.PI / 180;
-  const rdx = (lx - 0.5) * drawW;
-  const rdy = (ly - 0.5) * drawH;
-  const dx = rdx * Math.cos(rot) - rdy * Math.sin(rot);
-  const dy = rdx * Math.sin(rot) + rdy * Math.cos(rot);
+  // work canvas pixels → base image pixel delta from center
+  const rx = (localX / wkW - 0.5) * drawW;
+  const ry = (localY / wkH - 0.5) * drawH;
+  // rotate
+  const dx = rx * Math.cos(rot) - ry * Math.sin(rot);
+  const dy = rx * Math.sin(rot) + ry * Math.cos(rot);
+  // base image pixels → screen
   return { x: oxBase + (fix.x + dx) * s, y: oyBase + (fix.y + dy) * s };
 }
 
@@ -10253,6 +10532,12 @@ async function enterFixesMode(cbtis, filename) {
   const encName = encodeURIComponent(filename);
   const panel = document.getElementById('previewPanel');
   if (!panel) return;
+
+  // Set panel dataset so toggleWorkflowDone can find the correct group
+  panel.dataset.cbtis = cbtis;
+  panel.dataset.cutout = filename;
+  const _gd = groups.find(g => g.cbtis === cbtis && g.cutout === filename);
+  if (_gd) { panel.dataset.group = _gd.group; panel.dataset.pano = _gd.output || ''; }
 
   panel.innerHTML = `
     <div class="refine-toolbar" id="fxToolbar">
@@ -10278,6 +10563,7 @@ async function enterFixesMode(cbtis, filename) {
       <span class="rf-sep"></span>
       <button class="rf-btn" onclick="fxUndo()" title="Deshacer (Ctrl+Z)">&#8617;</button>
       <button class="rf-btn" onclick="fxRedo()" title="Rehacer (Ctrl+Y)">&#8618;</button>
+      <button class="rf-btn active" id="fxPivotBtn" onclick="fxTogglePivot()" title="Mostrar/ocultar pivote (P)" style="color:#ff7733">&#9678; Pivote</button>
       <span class="rf-sep"></span>
       <span style="font-size:11px">Fotos:</span>
       <span id="fxThumbs"></span>
@@ -10356,6 +10642,8 @@ async function enterFixesMode(cbtis, filename) {
     try {
       const stRes = await fetch(`/api/fixes/state/${cbtis}/${encName}`);
       const st = await stRes.json();
+      // Restore per-photo rotations (even if no fixes yet)
+      if (st.subRotations) fxSubRotations = st.subRotations;
       if (st.fixes && st.fixes.length > 0) {
         fxNextId = 0;
         for (const fx of st.fixes) {
@@ -10398,8 +10686,13 @@ async function enterFixesMode(cbtis, filename) {
         const hiImg = await loadImg(hiBlobUrl);
         URL.revokeObjectURL(hiBlobUrl);
         if (!fxMode) return;
+        // Scale zoom to maintain same visual size when image dimensions change
+        const oldW = fxImgW;
         fxBaseImg = hiImg;
         fxImgW = hiImg.width; fxImgH = hiImg.height;
+        if (oldW > 0 && fxImgW > 0) {
+          pvZoom *= oldW / fxImgW;
+        }
         // Re-extract fix images at hi-res too
         await fxReloadFixImages();
         fxDraw();
@@ -10440,6 +10733,204 @@ async function fxReloadFixImages() {
       fx._workCanvas = fxBuildWorkCanvas(fx);
     } catch { fx._img = null; }
   }
+}
+
+// Convert display-normalized coords (0-1 in rotated display space) to workCanvas pixel coords
+// The workCanvas is in the original unrotated image space, so we must un-rotate.
+function fxSubDisplayToPixel(nx, ny) {
+  const rot = fxSubRotation || 0;
+  const swapped = (rot === 90 || rot === 270);
+  const dw = swapped ? fxSubImgH : fxSubImgW;
+  const dh = swapped ? fxSubImgW : fxSubImgH;
+  if (rot === 0) return { x: nx * fxSubImgW, y: ny * fxSubImgH };
+  // Display-normalized to offset from center in display pixel space
+  const dx = (nx - 0.5) * dw;
+  const dy = (ny - 0.5) * dh;
+  // Un-rotate to original image space
+  const cosR = Math.cos(rot * Math.PI / 180);
+  const sinR = Math.sin(rot * Math.PI / 180);
+  return {
+    x: dx * cosR + dy * sinR + fxSubImgW / 2,
+    y: -dx * sinR + dy * cosR + fxSubImgH / 2
+  };
+}
+
+// Init sub-editor workCanvas — starts EMPTY (transparent).
+// User paints with brush/lasso to ADD to selection (restore = green overlay).
+// User erases to REMOVE from selection (erase = no green overlay).
+function fxSubInitWorkCanvas() {
+  if (!fxSubImg) return;
+  fxSubWorkCanvas = document.createElement('canvas');
+  fxSubWorkCanvas.width = fxSubImgW;
+  fxSubWorkCanvas.height = fxSubImgH;
+  // Do NOT draw the image — start blank so green overlay only shows where user paints
+}
+
+// Apply brush stroke directly to sub-editor workCanvas in real-time
+// Sub-editor brush: works on a SELECTION MASK (not the actual image).
+// restore = paint white on mask (add to selection → shows green overlay)
+// erase = destination-out on mask (remove from selection → removes green)
+function fxSubBrushOnWorkCanvas(px, py, radius) {
+  if (!fxSubWorkCanvas) return;
+  const ctx = fxSubWorkCanvas.getContext('2d');
+  const feather = fxBrushFeather, flow = fxBrushFlow;
+  const isErase = (fxAction === 'erase');
+
+  if (isErase) {
+    // Erase: remove from selection mask
+    if (feather > 0.01 && radius > 1) {
+      const innerR = radius * (1 - feather);
+      ctx.globalCompositeOperation = 'destination-out';
+      const grad = ctx.createRadialGradient(px, py, innerR, px, py, radius);
+      grad.addColorStop(0, `rgba(0,0,0,${flow})`);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    } else {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = `rgba(0,0,0,${flow})`;
+      ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  } else {
+    // Restore: paint white on selection mask (like tgBrushOnMask)
+    if (feather > 0.01 && radius > 1) {
+      const innerR = radius * (1 - feather);
+      ctx.globalCompositeOperation = 'source-over';
+      const grad = ctx.createRadialGradient(px, py, innerR, px, py, radius);
+      grad.addColorStop(0, `rgba(255,255,255,${flow})`);
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
+    } else {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = `rgba(255,255,255,${flow})`;
+      ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+// Save/restore sub-editor workCanvas for undo
+function fxSubSaveSnapshot() {
+  if (!fxSubWorkCanvas) return;
+  fxSubSnapshot = fxSubWorkCanvas.getContext('2d').getImageData(0, 0, fxSubWorkCanvas.width, fxSubWorkCanvas.height);
+}
+
+function fxSubUndo() {
+  if (!fxSubSnapshot || !fxSubWorkCanvas) return;
+  fxSubWorkCanvas.getContext('2d').putImageData(fxSubSnapshot, 0, 0);
+  if (fxSubStrokes.length > 0) fxSubStrokes.pop();
+  fxDraw();
+}
+
+// Apply lasso stroke to sub-editor workCanvas (selection mask)
+// restore = fill polygon white (add to selection), erase = destination-out (remove)
+function fxSubLassoOnWorkCanvas(stroke) {
+  if (!fxSubWorkCanvas) return;
+  const ctx = fxSubWorkCanvas.getContext('2d');
+  const pts = stroke.points;
+  if (!pts || pts.length < 3) return;
+  const isErase = (stroke.mode === 'erase');
+  // Build polygon path in workCanvas pixel coords (un-rotated from display space)
+  const tmpC = document.createElement('canvas');
+  tmpC.width = fxSubImgW; tmpC.height = fxSubImgH;
+  const tmpCtx = tmpC.getContext('2d');
+  tmpCtx.fillStyle = '#000';
+  tmpCtx.beginPath();
+  const p0 = fxSubDisplayToPixel(pts[0].x, pts[0].y);
+  tmpCtx.moveTo(p0.x, p0.y);
+  for (let i = 1; i < pts.length; i++) {
+    const pi = fxSubDisplayToPixel(pts[i].x, pts[i].y);
+    tmpCtx.lineTo(pi.x, pi.y);
+  }
+  tmpCtx.closePath(); tmpCtx.fill();
+  // Apply feather blur
+  const feather = fxBrushFeather;
+  const blurR = Math.max(0.5, feather * 30);
+  tmpCtx.filter = `blur(${blurR}px)`;
+  tmpCtx.drawImage(tmpC, 0, 0);
+  tmpCtx.filter = 'none';
+  if (isErase) {
+    ctx.save(); ctx.globalCompositeOperation = 'destination-out';
+    ctx.drawImage(tmpC, 0, 0); ctx.restore();
+  } else {
+    // Restore: paint white through feathered lasso shape
+    const whiteC = document.createElement('canvas');
+    whiteC.width = fxSubImgW; whiteC.height = fxSubImgH;
+    const whiteCtx = whiteC.getContext('2d');
+    whiteCtx.fillStyle = '#fff';
+    whiteCtx.fillRect(0, 0, fxSubImgW, fxSubImgH);
+    whiteCtx.globalCompositeOperation = 'destination-in';
+    whiteCtx.drawImage(tmpC, 0, 0);
+    ctx.save(); ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(whiteC, 0, 0); ctx.restore();
+  }
+}
+
+// Re-apply a full sub-editor stroke to workCanvas (for hi-res reload)
+function fxApplySubStrokeToWorkCanvas(stroke) {
+  if (!fxSubWorkCanvas) return;
+  if (stroke.type === 'lasso') {
+    fxSubLassoOnWorkCanvas(stroke);
+    return;
+  }
+  const rot = fxSubRotation || 0;
+  const swapped = (rot === 90 || rot === 270);
+  const dw = swapped ? fxSubImgH : fxSubImgW;
+  const subBrushR = fxBrushSize * (fxSubImgW / dw);
+  for (const p of stroke.points) {
+    const wc = fxSubDisplayToPixel(p.x, p.y);
+    fxSubBrushOnWorkCanvas(wc.x, wc.y, subBrushR);
+  }
+}
+
+// Apply brush stroke directly to workCanvas in real-time (matching tgBrushOnMask behavior)
+let fxLastBrushPt = null;
+function fxBrushOnWorkCanvas(fix, localX, localY, radius) {
+  if (!fix._workCanvas) return;
+  const ctx = fix._workCanvas.getContext('2d');
+  const w = fix._workCanvas.width, h = fix._workCanvas.height;
+  const feather = fxBrushFeather, flow = fxBrushFlow;
+  const isErase = (fxAction === 'erase');
+
+  if (isErase) {
+    // Erase: exact same pattern as tgBrushOnMask
+    if (feather > 0.01 && radius > 1) {
+      const innerR = radius * (1 - feather);
+      ctx.globalCompositeOperation = 'destination-out';
+      const grad = ctx.createRadialGradient(localX, localY, innerR, localX, localY, radius);
+      grad.addColorStop(0, `rgba(0,0,0,${flow})`);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(localX, localY, radius, 0, Math.PI * 2); ctx.fill();
+    } else {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = `rgba(0,0,0,${flow})`;
+      ctx.beginPath(); ctx.arc(localX, localY, radius, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  } else {
+    // Restore: stamp original pixels through gradient mask (single temp canvas)
+    if (!fix._img) return;
+    const tmpC = document.createElement('canvas');
+    tmpC.width = w; tmpC.height = h;
+    const tmpCtx = tmpC.getContext('2d');
+    tmpCtx.drawImage(fix._img, 0, 0);
+    tmpCtx.globalCompositeOperation = 'destination-in';
+    if (feather > 0.01 && radius > 1) {
+      const innerR = radius * (1 - feather);
+      const grad = tmpCtx.createRadialGradient(localX, localY, innerR, localX, localY, radius);
+      grad.addColorStop(0, `rgba(255,255,255,${flow})`);
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      tmpCtx.fillStyle = grad;
+    } else {
+      tmpCtx.fillStyle = `rgba(255,255,255,${flow})`;
+    }
+    tmpCtx.beginPath(); tmpCtx.arc(localX, localY, radius, 0, Math.PI * 2); tmpCtx.fill();
+    ctx.drawImage(tmpC, 0, 0);
+  }
+  fxLastBrushPt = { x: localX, y: localY };
 }
 
 function fxBuildWorkCanvas(fx) {
@@ -10488,55 +10979,48 @@ function fxApplyEditStroke(ctx, stroke, w, h, origImg) {
       ctx.drawImage(panoC, 0, 0); ctx.restore();
     }
   } else {
-    // Brush: Togas-style radial gradient (single accumulation canvas)
-    const radius = stroke.radius * Math.max(w, h);
-    const innerR = radius * (1 - feather);
-    const tmpC = document.createElement('canvas');
-    tmpC.width = w; tmpC.height = h;
-    const tmpCtx = tmpC.getContext('2d');
-
-    for (const p of stroke.points) {
-      const px = p.x * w, py = p.y * h;
-      if (feather > 0.01 && radius > 1) {
-        const grad = tmpCtx.createRadialGradient(px, py, Math.max(0.5, innerR), px, py, radius);
-        if (stroke.mode === 'erase') {
+    // Brush: same pattern as tgBrushOnMask — overlapping circles, no connecting line
+    const radius = stroke.radius;  // already in work canvas pixels
+    if (stroke.mode === 'erase') {
+      // Erase: draw gradient circles directly with destination-out
+      for (const p of stroke.points) {
+        const px = p.x, py = p.y;
+        if (feather > 0.01 && radius > 1) {
+          const innerR = radius * (1 - feather);
+          ctx.globalCompositeOperation = 'destination-out';
+          const grad = ctx.createRadialGradient(px, py, innerR, px, py, radius);
           grad.addColorStop(0, `rgba(0,0,0,${flow})`);
           grad.addColorStop(1, 'rgba(0,0,0,0)');
+          ctx.fillStyle = grad;
+          ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
         } else {
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.fillStyle = `rgba(0,0,0,${flow})`;
+          ctx.beginPath(); ctx.arc(px, py, radius, 0, Math.PI * 2); ctx.fill();
+        }
+      }
+      ctx.globalCompositeOperation = 'source-over';
+    } else {
+      // Restore: stamp original pixels per circle (like tgBrushOnMask paints white)
+      for (const p of stroke.points) {
+        const px = p.x, py = p.y;
+        const tmpC = document.createElement('canvas');
+        tmpC.width = w; tmpC.height = h;
+        const tmpCtx = tmpC.getContext('2d');
+        tmpCtx.drawImage(origImg, 0, 0);
+        tmpCtx.globalCompositeOperation = 'destination-in';
+        if (feather > 0.01 && radius > 1) {
+          const innerR = radius * (1 - feather);
+          const grad = tmpCtx.createRadialGradient(px, py, innerR, px, py, radius);
           grad.addColorStop(0, `rgba(255,255,255,${flow})`);
           grad.addColorStop(1, 'rgba(255,255,255,0)');
+          tmpCtx.fillStyle = grad;
+        } else {
+          tmpCtx.fillStyle = `rgba(255,255,255,${flow})`;
         }
-        tmpCtx.fillStyle = grad;
-      } else {
-        tmpCtx.fillStyle = stroke.mode === 'erase'
-          ? `rgba(0,0,0,${flow})` : `rgba(255,255,255,${flow})`;
+        tmpCtx.beginPath(); tmpCtx.arc(px, py, radius, 0, Math.PI * 2); tmpCtx.fill();
+        ctx.drawImage(tmpC, 0, 0);
       }
-      tmpCtx.beginPath(); tmpCtx.arc(px, py, radius, 0, Math.PI * 2); tmpCtx.fill();
-    }
-    // Connect points with lines for smooth strokes
-    if (stroke.points.length > 1) {
-      tmpCtx.lineWidth = radius * 2; tmpCtx.lineCap = 'round'; tmpCtx.lineJoin = 'round';
-      tmpCtx.strokeStyle = stroke.mode === 'erase'
-        ? `rgba(0,0,0,${flow})` : `rgba(255,255,255,${flow})`;
-      tmpCtx.beginPath();
-      tmpCtx.moveTo(stroke.points[0].x * w, stroke.points[0].y * h);
-      for (let i = 1; i < stroke.points.length; i++)
-        tmpCtx.lineTo(stroke.points[i].x * w, stroke.points[i].y * h);
-      tmpCtx.stroke();
-    }
-    // Apply accumulated mask
-    if (stroke.mode === 'erase') {
-      ctx.save(); ctx.globalCompositeOperation = 'destination-out';
-      ctx.drawImage(tmpC, 0, 0); ctx.restore();
-    } else {
-      const panoC = document.createElement('canvas');
-      panoC.width = w; panoC.height = h;
-      const panoCtx = panoC.getContext('2d');
-      panoCtx.drawImage(origImg, 0, 0);
-      panoCtx.globalCompositeOperation = 'destination-in';
-      panoCtx.drawImage(tmpC, 0, 0);
-      ctx.save(); ctx.globalCompositeOperation = 'source-over';
-      ctx.drawImage(panoC, 0, 0); ctx.restore();
     }
   }
 }
@@ -10546,18 +11030,18 @@ function fxDrawStrokePath(ctx, stroke, w, h) {
   if (!pts || pts.length === 0) return;
   if (stroke.type === 'lasso') {
     ctx.beginPath();
-    ctx.moveTo(pts[0].x * w, pts[0].y * h);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * w, pts[i].y * h);
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
     ctx.closePath(); ctx.fill();
   } else {
-    const r = stroke.radius * Math.max(w, h);
+    const r = stroke.radius;
     for (const p of pts) {
-      ctx.beginPath(); ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
     }
     if (pts.length > 1) {
       ctx.lineWidth = r * 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      ctx.beginPath(); ctx.moveTo(pts[0].x * w, pts[0].y * h);
-      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * w, pts[i].y * h);
+      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
       ctx.stroke();
     }
   }
@@ -10582,6 +11066,7 @@ function fxSaveState() {
   if (!fxCbtis || !fxFilename) return;
   const data = {
     brushFeather: fxBrushFeather, brushFlow: fxBrushFlow,
+    subRotations: fxSubRotations,
     fixes: fxFixes.map(fx => ({
       id: fx.id, sourceId: fx.sourceId, group: fx.group || fxSourceGroup,
       selectionStrokes: fx.selectionStrokes,
@@ -10589,6 +11074,8 @@ function fxSaveState() {
       rotation: fx.rotation || 0,
       srcRotation: fx.srcRotation || 0,
       fxScale: fx.fxScale || 1.0,
+      pivotX: fx.pivotX != null ? fx.pivotX : 0.5,
+      pivotY: fx.pivotY != null ? fx.pivotY : 0.5,
       bboxW: fx.bboxW, bboxH: fx.bboxH,
       opacity: fx.opacity, visible: fx.visible,
       editStrokes: fx.editStrokes || [],
@@ -10645,6 +11132,13 @@ function fxSetAction(btn, action) {
   fxAction = action;
   btn.parentElement.querySelectorAll('.rf-btn.restore,.rf-btn.erase').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
+}
+
+function fxTogglePivot() {
+  fxShowPivot = !fxShowPivot;
+  const btn = document.getElementById('fxPivotBtn');
+  if (btn) btn.classList.toggle('active', fxShowPivot);
+  fxDraw();
 }
 
 // --- Thumbnails ---
@@ -10720,7 +11214,7 @@ function fxDraw() {
   ctx.clearRect(0, 0, cw, ch);
 
   if (fxSubMode) {
-    // Sub-editor: show source photo (with rotation)
+    // Sub-editor: show original image + green selection mask overlay
     if (fxSubImg) {
       const s = pvZoom;
       const rot = fxSubRotation || 0;
@@ -10729,39 +11223,48 @@ function fxDraw() {
       const dh = swapped ? fxSubImgW : fxSubImgH;
       const ox = (cw - dw * s) / 2 + pvX;
       const oy = (ch - dh * s) / 2 + pvY;
+      // 1. Always draw original image as base
       ctx.save();
       ctx.translate(ox + dw * s / 2, oy + dh * s / 2);
       ctx.rotate(rot * Math.PI / 180);
       ctx.drawImage(fxSubImg, -fxSubImgW * s / 2, -fxSubImgH * s / 2, fxSubImgW * s, fxSubImgH * s);
       ctx.restore();
-      // Draw strokes in rotated space
-      for (const stroke of fxSubStrokes) {
+      // 2. Draw green selection mask overlay (masked by workCanvas)
+      if (fxSubWorkCanvas) {
+        const maskC = document.createElement('canvas');
+        maskC.width = fxSubImgW; maskC.height = fxSubImgH;
+        const maskCtx = maskC.getContext('2d');
+        maskCtx.fillStyle = 'rgba(80,255,80,0.35)';
+        maskCtx.fillRect(0, 0, fxSubImgW, fxSubImgH);
+        maskCtx.globalCompositeOperation = 'destination-in';
+        maskCtx.drawImage(fxSubWorkCanvas, 0, 0);
         ctx.save();
-        ctx.globalAlpha = 0.4;
-        ctx.fillStyle = stroke.mode === 'erase' ? 'rgba(255,80,80,0.5)' : 'rgba(80,255,80,0.5)';
-        ctx.strokeStyle = ctx.fillStyle;
-        fxDrawStrokeOnCanvas(ctx, stroke, ox, oy, s, dw, dh);
+        ctx.translate(ox + dw * s / 2, oy + dh * s / 2);
+        ctx.rotate(rot * Math.PI / 180);
+        ctx.drawImage(maskC, -fxSubImgW * s / 2, -fxSubImgH * s / 2, fxSubImgW * s, fxSubImgH * s);
         ctx.restore();
       }
-      // In-progress stroke
-      if (fxSubCurStroke) {
-        ctx.save();
-        ctx.globalAlpha = 0.4;
-        ctx.fillStyle = fxAction === 'erase' ? 'rgba(255,80,80,0.5)' : 'rgba(80,255,80,0.5)';
-        ctx.strokeStyle = ctx.fillStyle;
-        fxDrawStrokeOnCanvas(ctx, fxSubCurStroke, ox, oy, s, dw, dh);
-        ctx.restore();
-      }
-      // Lasso points
+      // No green/red overlay — strokes applied directly to workCanvas
+      // Lasso points still shown as guide
       if (fxSubLassoPoints.length > 0) {
         ctx.save();
-        ctx.strokeStyle = fxAction === 'erase' ? '#ff5050' : '#50ff50';
-        ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+        const lassoColor = fxAction === 'restore' ? 'rgba(158,206,106' : 'rgba(247,118,142';
+        ctx.strokeStyle = lassoColor + ',0.8)';
+        ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
         ctx.beginPath();
         ctx.moveTo(ox + fxSubLassoPoints[0].x * dw * s, oy + fxSubLassoPoints[0].y * dh * s);
         for (let i = 1; i < fxSubLassoPoints.length; i++)
           ctx.lineTo(ox + fxSubLassoPoints[i].x * dw * s, oy + fxSubLassoPoints[i].y * dh * s);
         ctx.stroke(); ctx.setLineDash([]);
+        // Draw visible node dots
+        for (let i = 0; i < fxSubLassoPoints.length; i++) {
+          const npx = ox + fxSubLassoPoints[i].x * dw * s;
+          const npy = oy + fxSubLassoPoints[i].y * dh * s;
+          const isFirst = (i === 0 && fxSubLassoPoints.length >= 3);
+          ctx.beginPath(); ctx.arc(npx, npy, isFirst ? 8 : 5, 0, Math.PI * 2);
+          ctx.fillStyle = isFirst ? 'rgba(255,255,100,0.95)' : lassoColor + ',0.9)';
+          ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+        }
         ctx.restore();
       }
     }
@@ -10812,38 +11315,29 @@ function fxDraw() {
         fxDrawHandles(ctx, fx, ox, oy, s);
       }
     }
-    // In-progress edit stroke on selected fix
-    if (fxCurStroke && fxSelected >= 0) {
+    // In-progress edit stroke (lasso only — brush applies directly to workCanvas in real-time)
+    if (fxCurStroke && fxCurStroke.type === 'lasso' && fxSelected >= 0) {
       const fix = fxFixes[fxSelected];
       ctx.save();
-      ctx.globalAlpha = 0.4;
-      ctx.fillStyle = fxAction === 'erase' ? 'rgba(255,80,80,0.5)' : 'rgba(80,255,80,0.5)';
-      ctx.strokeStyle = ctx.fillStyle;
-      if (fxCurStroke.local && fix) {
-        // Draw in fix layer's transformed space
+      ctx.strokeStyle = fxAction === 'erase' ? 'rgba(255,80,80,0.8)' : 'rgba(80,255,80,0.8)';
+      ctx.lineWidth = 2 / s;
+      if (fxCurStroke.local && fix && fix._workCanvas) {
         const fxS = fix.fxScale || 1.0;
-        const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
-        const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
-        const drawW = bw * fxS, drawH = bh * fxS;
+        const bw = fix.bboxW || fix._workCanvas.width;
+        const bh = fix.bboxH || fix._workCanvas.height;
+        const drawW = bw * fxS * s, drawH = bh * fxS * s;
+        const wkW = fix._workCanvas.width, wkH = fix._workCanvas.height;
         const fsx = ox + fix.x * s, fsy = oy + fix.y * s;
         ctx.translate(fsx, fsy);
         if (fix.rotation) ctx.rotate(fix.rotation * Math.PI / 180);
-        // Draw stroke points in local coords (0-1)
         const pts = fxCurStroke.points;
-        const r = fxCurStroke.radius * Math.max(drawW, drawH);
-        if (fxCurStroke.type === 'lasso' && pts.length > 0) {
+        if (pts.length > 0) {
           ctx.beginPath();
-          ctx.moveTo(-drawW/2 + pts[0].x * drawW, -drawH/2 + pts[0].y * drawH);
+          ctx.moveTo(-drawW/2 + pts[0].x / wkW * drawW, -drawH/2 + pts[0].y / wkH * drawH);
           for (let i = 1; i < pts.length; i++)
-            ctx.lineTo(-drawW/2 + pts[i].x * drawW, -drawH/2 + pts[i].y * drawH);
+            ctx.lineTo(-drawW/2 + pts[i].x / wkW * drawW, -drawH/2 + pts[i].y / wkH * drawH);
           ctx.stroke();
-        } else if (pts.length > 0) {
-          for (const p of pts) {
-            ctx.beginPath(); ctx.arc(-drawW/2 + p.x * drawW, -drawH/2 + p.y * drawH, r, 0, Math.PI * 2); ctx.fill();
-          }
         }
-      } else {
-        fxDrawStrokeOnCanvas(ctx, fxCurStroke, ox, oy, s, fxImgW, fxImgH);
       }
       ctx.restore();
     }
@@ -10852,9 +11346,10 @@ function fxDraw() {
       const fix = fxFixes[fxSelected];
       if (fix) {
         const fxS = fix.fxScale || 1.0;
-        const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
-        const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
-        const drawW = bw * fxS, drawH = bh * fxS;
+        const bw = fix.bboxW || fix._workCanvas.width;
+        const bh = fix.bboxH || fix._workCanvas.height;
+        const drawW = bw * fxS * s, drawH = bh * fxS * s;
+        const wkW = fix._workCanvas.width, wkH = fix._workCanvas.height;
         const fsx = ox + fix.x * s, fsy = oy + fix.y * s;
         const lassoColor = fxAction === 'restore' ? 'rgba(158,206,106' : 'rgba(247,118,142';
         ctx.save();
@@ -10863,15 +11358,15 @@ function fxDraw() {
         ctx.strokeStyle = lassoColor + ',0.8)';
         ctx.lineWidth = 2 / s; ctx.setLineDash([6/s, 4/s]);
         ctx.beginPath();
-        ctx.moveTo(-drawW/2 + fxLassoPoints[0].x * drawW, -drawH/2 + fxLassoPoints[0].y * drawH);
+        ctx.moveTo(-drawW/2 + fxLassoPoints[0].x / wkW * drawW, -drawH/2 + fxLassoPoints[0].y / wkH * drawH);
         for (let i = 1; i < fxLassoPoints.length; i++)
-          ctx.lineTo(-drawW/2 + fxLassoPoints[i].x * drawW, -drawH/2 + fxLassoPoints[i].y * drawH);
+          ctx.lineTo(-drawW/2 + fxLassoPoints[i].x / wkW * drawW, -drawH/2 + fxLassoPoints[i].y / wkH * drawH);
         ctx.stroke(); ctx.setLineDash([]);
         // Nodes
         const nodeR = 5 / s;
         for (let i = 0; i < fxLassoPoints.length; i++) {
-          const px = -drawW/2 + fxLassoPoints[i].x * drawW;
-          const py = -drawH/2 + fxLassoPoints[i].y * drawH;
+          const px = -drawW/2 + fxLassoPoints[i].x / wkW * drawW;
+          const py = -drawH/2 + fxLassoPoints[i].y / wkH * drawH;
           const isFirst = (i === 0 && fxLassoPoints.length >= 3);
           ctx.beginPath(); ctx.arc(px, py, isFirst ? nodeR * 1.6 : nodeR, 0, Math.PI * 2);
           ctx.fillStyle = isFirst ? 'rgba(255,255,100,0.95)' : lassoColor + ',0.9)';
@@ -10942,6 +11437,23 @@ function fxDrawHandles(ctx, fx, ox, oy, scale) {
   // Scale handle (bottom-right corner)
   ctx.beginPath(); ctx.arc(fw / 2, fh / 2, 6, 0, Math.PI * 2);
   ctx.fillStyle = fxScaling ? '#e0af68' : '#bb9af7'; ctx.fill();
+  // Pivot crosshair (visible only when fxShowPivot is true and tool is 'move')
+  if (fxShowPivot && fxTool === 'move') {
+    const pvtX = ((fx.pivotX != null ? fx.pivotX : 0.5) - 0.5) * fw;
+    const pvtY = ((fx.pivotY != null ? fx.pivotY : 0.5) - 0.5) * fh;
+    const arm = 10;
+    ctx.strokeStyle = fxDraggingPivot ? '#e0af68' : '#ff7733';
+    ctx.lineWidth = 2;
+    // Crosshair lines
+    ctx.beginPath(); ctx.moveTo(pvtX - arm, pvtY); ctx.lineTo(pvtX + arm, pvtY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pvtX, pvtY - arm); ctx.lineTo(pvtX, pvtY + arm); ctx.stroke();
+    // Center dot
+    ctx.beginPath(); ctx.arc(pvtX, pvtY, 3, 0, Math.PI * 2);
+    ctx.fillStyle = fxDraggingPivot ? '#e0af68' : '#ff7733'; ctx.fill();
+    // Circle ring
+    ctx.beginPath(); ctx.arc(pvtX, pvtY, 8, 0, Math.PI * 2);
+    ctx.strokeStyle = fxDraggingPivot ? '#e0af68' : '#ff7733'; ctx.lineWidth = 1.5; ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -10964,7 +11476,9 @@ function fxStartNewSelection() {
 async function fxEnterSubEditor(photoId) {
   fxSubMode = true; fxSubPhotoId = photoId;
   fxSubStrokes = []; fxSubCurStroke = null; fxSubLassoPoints = []; fxSubDrawing = false;
+  fxSubWorkCanvas = null; fxSubSnapshot = null;
   fxSubRotation = fxSubRotations[photoId] || 0;  // Recall saved rotation
+  // Initialize workCanvas immediately so show green overlay from the start
   fxTool = 'brush'; fxAction = 'restore';  // Default to brush+restore in sub-editor
   // Update toolbar active buttons to match
   document.querySelectorAll('#fxToolbar .rf-btn.erase, #fxToolbar .rf-btn.restore').forEach(b => {
@@ -10990,7 +11504,8 @@ async function fxEnterSubEditor(photoId) {
   try {
     fxSubImg = await loadImg(`/api/fixes/source-image/${fxCbtis}/${fxSourceGroup}/${photoId}?maxw=800`);
     fxSubImgW = fxSubImg.width; fxSubImgH = fxSubImg.height;
-    pvZoom = 1; pvX = 0; pvY = 0;
+    pvZoom = 1; pvX = 0; pvY = 000    // Initialize workCanvas with full original image (green overlay = full selection)
+    fxSubWorkCanvas = null; fxSubInitWorkCanvas();
     fxZoomFit();
     // Load hi-res in background
     setTimeout(async () => {
@@ -10998,7 +11513,22 @@ async function fxEnterSubEditor(photoId) {
       try {
         const hi = await loadImg(`/api/fixes/source-image/${fxCbtis}/${fxSourceGroup}/${photoId}?maxw=99999`);
         if (!fxSubMode || fxSubPhotoId !== photoId) return;
+        // Scale zoom to maintain same visual size when image dimensions change
+        const oldSubW = fxSubImgW;
         fxSubImg = hi; fxSubImgW = hi.width; fxSubImgH = hi.height;
+        if (oldSubW > 0 && fxSubImgW > 0) {
+          pvZoom *= oldSubW / fxSubImgW;
+        }
+        // Recreate workCanvas with hi-res and reapply existing strokes
+        if (fxSubStrokes.length > 0) {
+          fxSubWorkCanvas = null; fxSubInitWorkCanvas();
+          // Re-apply all strokes on new hi-res workCanvas
+          for (const stroke of fxSubStrokes) {
+            fxApplySubStrokeToWorkCanvas(stroke);
+          }
+        } else {
+          fxSubWorkCanvas = null; fxSubInitWorkCanvas();
+        }
         fxDraw();
       } catch {}
     }, 100);
@@ -11007,7 +11537,7 @@ async function fxEnterSubEditor(photoId) {
 }
 
 function fxCancelSubEditor() {
-  fxSubMode = false; fxSubImg = null;
+  fxSubMode = false; fxSubImg = null; fxSubWorkCanvas = null; fxSubSnapshot = null;
   const el = document.getElementById('fxSubActions');
   if (el) el.remove();
   fxZoomFit();
@@ -11019,13 +11549,17 @@ function fxSubRotateCW() {
   // Clear strokes since they don't match new orientation
   if (fxSubStrokes.length > 0) {
     fxSubStrokes = [];
+    fxSubWorkCanvas = null; fxSubInitWorkCanvas();
     showToast('Seleccion borrada por rotacion', 'warn');
   }
   fxDraw();
+  fxSaveState();  // Persist rotation to server
 }
 
 async function fxConfirmExtraction() {
   if (fxSubStrokes.length === 0) { showToast('Selecciona algo primero', 'warn'); return; }
+  if (!fxSubMode) return;  // Guard against double-click re-entry
+  fxSubMode = false;  // Prevent re-entry immediately
   showToast('Extrayendo seleccion...', 'info');
   const encName = encodeURIComponent(fxFilename);
   const fixId = fxNextId++;
@@ -11043,6 +11577,7 @@ async function fxConfirmExtraction() {
       const errTxt = await res.text();
       console.error('[FX] extract error:', res.status, errTxt);
       showToast('Error extrayendo: ' + res.status, 'error');
+      fxSubMode = true;  // Restore so user can retry
       return;
     }
     const bboxHeader = res.headers.get('X-Fix-Bbox');
@@ -11069,6 +11604,8 @@ async function fxConfirmExtraction() {
       y: fxImgH / 2,
       // fxScale is user's manual scale (1.0 = natural mapped size)
       fxScale: 1.0,
+      // Pivot point (normalized 0-1 within bounding box, 0.5 = center)
+      pivotX: 0.5, pivotY: 0.5,
       // Drawing size in base image pixel coords (already mapped)
       bboxW: (bbox.pw || img.width) * srcToBase,
       bboxH: (bbox.ph || img.height) * srcToBase,
@@ -11081,8 +11618,8 @@ async function fxConfirmExtraction() {
     fxFixes.push(fx);
     fxSelected = fxFixes.length - 1;
 
-    // Exit sub-editor
-    fxSubMode = false; fxSubImg = null;
+    // Exit sub-editor (fxSubMode already set false at top to prevent re-entry)
+    fxSubImg = null;
     const el = document.getElementById('fxSubActions');
     if (el) el.remove();
 
@@ -11090,7 +11627,7 @@ async function fxConfirmExtraction() {
     fxZoomFit();
     fxSaveState();
     showToast('Fix creado exitosamente', 'ok');
-  } catch(e) { showToast('Error: ' + e.message, 'error'); }
+  } catch(e) { fxSubMode = true; showToast('Error: ' + e.message, 'error'); }
 }
 
 // --- Undo/Redo ---
@@ -11099,6 +11636,7 @@ function fxSaveSnapshot() {
     id: fx.id, sourceId: fx.sourceId, group: fx.group,
     selectionStrokes: fx.selectionStrokes,
     x: fx.x, y: fx.y, rotation: fx.rotation, scale: fx.scale,
+    fxScale: fx.fxScale, pivotX: fx.pivotX, pivotY: fx.pivotY,
     opacity: fx.opacity, visible: fx.visible,
     editStrokes: fx.editStrokes || []
   }))), selected: fxSelected };
@@ -11136,6 +11674,7 @@ function fxUndo() {
     id: fx.id, sourceId: fx.sourceId, group: fx.group,
     selectionStrokes: fx.selectionStrokes,
     x: fx.x, y: fx.y, rotation: fx.rotation, scale: fx.scale,
+    fxScale: fx.fxScale, pivotX: fx.pivotX, pivotY: fx.pivotY,
     opacity: fx.opacity, visible: fx.visible, editStrokes: fx.editStrokes || []
   }))), selected: fxSelected };
   fxRedoStack.push(curSnap);
@@ -11148,6 +11687,7 @@ function fxRedo() {
     id: fx.id, sourceId: fx.sourceId, group: fx.group,
     selectionStrokes: fx.selectionStrokes,
     x: fx.x, y: fx.y, rotation: fx.rotation, scale: fx.scale,
+    fxScale: fx.fxScale, pivotX: fx.pivotX, pivotY: fx.pivotY,
     opacity: fx.opacity, visible: fx.visible, editStrokes: fx.editStrokes || []
   }))), selected: fxSelected };
   fxUndoStack.push(curSnap);
@@ -11197,17 +11737,49 @@ function fxMouseDown(e) {
     if (nx < 0 || ny < 0 || nx > 1 || ny > 1) return;
 
     if (fxTool === 'lasso') {
-      fxSubLassoPoints.push({ x: nx, y: ny });
+      // Check close on first node
+      if (fxSubLassoPoints.length >= 3) {
+        const fpx = ox + fxSubLassoPoints[0].x * dw * s;
+        const fpy = oy + fxSubLassoPoints[0].y * dh * s;
+        if ((mx - fpx) * (mx - fpx) + (my - fpy) * (my - fpy) <= 225) {
+          if (!fxSubWorkCanvas) fxSubInitWorkCanvas();
+          fxSubSaveSnapshot();
+          const lassoStroke = { type: 'lasso', mode: fxAction, points: [...fxSubLassoPoints], radius: 0 };
+          fxSubLassoOnWorkCanvas(lassoStroke);
+          fxSubStrokes.push(lassoStroke);
+          fxSubLassoPoints = [];
+          fxDraw();
+          return;
+        }
+      }
+      // Check hit on existing node → drag
+      let hitNode = -1;
+      for (let i = 0; i < fxSubLassoPoints.length; i++) {
+        const spx = ox + fxSubLassoPoints[i].x * dw * s;
+        const spy = oy + fxSubLassoPoints[i].y * dh * s;
+        if ((mx - spx) * (mx - spx) + (my - spy) * (my - spy) <= 225) { hitNode = i; break; }
+      }
+      if (hitNode >= 0) {
+        fxSubDraggingNode = hitNode;
+      } else {
+        fxSubLassoPoints.push({ x: nx, y: ny });
+      }
       fxDraw();
       return;
     }
-    // Brush
+    // Brush — apply in real-time to sub-editor workCanvas
+    if (!fxSubWorkCanvas) fxSubInitWorkCanvas();
+    fxSubSaveSnapshot();
     fxSubDrawing = true;
+    const subBrushR = fxBrushSize * (fxSubImgW / dw);
     fxSubCurStroke = {
       type: 'brush', mode: fxAction,
       points: [{ x: nx, y: ny }],
       radius: fxBrushSize / Math.max(dw, dh)
     };
+    // Convert display-normalized coords to workCanvas pixel coords (un-rotate)
+    const wc = fxSubDisplayToPixel(nx, ny);
+    fxSubBrushOnWorkCanvas(wc.x, wc.y, subBrushR);
     fxDraw();
     return;
   }
@@ -11237,10 +11809,44 @@ function fxMouseDown(e) {
           fxRotating = { idx: fxSelected, startAngle: Math.atan2(mx - fcx, -(my - fcy)), startRot: fx.rotation };
           return;
         }
-        // Scale handle
+        // Pivot handle (when visible)
+        if (fxShowPivot) {
+          const pvtRx = ((fx.pivotX != null ? fx.pivotX : 0.5) - 0.5) * fw;
+          const pvtRy = ((fx.pivotY != null ? fx.pivotY : 0.5) - 0.5) * fh;
+          if (Math.hypot(rx - pvtRx, ry - pvtRy) < 12) {
+            fxSaveSnapshot();
+            fxDraggingPivot = true;
+            fxDraw();
+            return;
+          }
+        }
+        // Scale handle — compute pivot screen position for pivot-based scaling
         if (Math.hypot(rx - fw / 2, ry - fh / 2) < 12) {
           fxSaveSnapshot();
-          fxScaling = { idx: fxSelected, startDist: Math.hypot(mx - fcx, my - fcy), startScale: fx.fxScale || 1.0 };
+          // Calculate pivot position in screen coords
+          const pNx = fx.pivotX != null ? fx.pivotX : 0.5;
+          const pNy = fx.pivotY != null ? fx.pivotY : 0.5;
+          const bw = fx.bboxW || fx._workCanvas.width;
+          const bh = fx.bboxH || fx._workCanvas.height;
+          const pivLocalX = (pNx - 0.5) * bw;
+          const pivLocalY = (pNy - 0.5) * bh;
+          const rotRad = (fx.rotation || 0) * Math.PI / 180;
+          const cosA = Math.cos(rotRad), sinA = Math.sin(rotRad);
+          // Pivot in base image coords
+          const pivBaseX = fx.x + (pivLocalX * fxS * cosA - pivLocalY * fxS * sinA);
+          const pivBaseY = fx.y + (pivLocalX * fxS * sinA + pivLocalY * fxS * cosA);
+          // Pivot in screen coords
+          const pivSx = oxBase + pivBaseX * s;
+          const pivSy = oyBase + pivBaseY * s;
+          fxScaling = {
+            idx: fxSelected,
+            startDist: Math.hypot(mx - pivSx, my - pivSy),
+            startScale: fxS,
+            pivBaseX: pivBaseX, pivBaseY: pivBaseY,
+            pivLocalX: pivLocalX, pivLocalY: pivLocalY,
+            pivSx: pivSx, pivSy: pivSy,
+            startX: fx.x, startY: fx.y
+          };
           return;
         }
         // Hit test for drag (inside bounding box)
@@ -11284,32 +11890,20 @@ function fxMouseDown(e) {
     showToast('Selecciona un fix primero', 'warn');
     return;
   }
-  const s = pvZoom;
-  const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
-  const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
-  const nx = (mx - oxBase) / (fxImgW * s);
-  const ny = (my - oyBase) / (fxImgH * s);
-
-  // Convert base-image coords to fix-layer local coords
   const fix = fxFixes[fxSelected];
+  const localPt = fxScreenToFixLocal(mx, my);
+  if (!localPt) return;
+  const lx = localPt.x, ly = localPt.y;
+  // Bounds check in work canvas pixels
+  const wkW = fix._workCanvas ? fix._workCanvas.width : 100;
+  const wkH = fix._workCanvas ? fix._workCanvas.height : 100;
+  if (lx < -wkW*0.1 || ly < -wkH*0.1 || lx > wkW*1.1 || ly > wkH*1.1) return;
   const fxS = fix.fxScale || 1.0;
-  const bw = fix.bboxW || (fix._workCanvas ? fix._workCanvas.width : 100);
-  const bh = fix.bboxH || (fix._workCanvas ? fix._workCanvas.height : 100);
+  const bw = fix.bboxW || wkW;
+  const bh = fix.bboxH || wkH;
   const drawW = bw * fxS;
   const drawH = bh * fxS;
   const rot = (fix.rotation || 0) * Math.PI / 180;
-  // Mouse in base image pixels relative to fix center
-  const dx = (nx - fix.x / fxImgW) * fxImgW;
-  const dy = (ny - fix.y / fxImgH) * fxImgH;
-  // Un-rotate
-  const rdx = dx * Math.cos(-rot) - dy * Math.sin(-rot);
-  const rdy = dx * Math.sin(-rot) + dy * Math.cos(-rot);
-  // Scale to work canvas
-  const wkW = fix._workCanvas ? fix._workCanvas.width : bw;
-  const wkH = fix._workCanvas ? fix._workCanvas.height : bh;
-  const lx = (rdx + drawW / 2) / drawW;
-  const ly = (rdy + drawH / 2) / drawH;
-  if (lx < -0.1 || ly < -0.1 || lx > 1.1 || ly > 1.1) return;
 
   if (fxTool === 'lasso') {
     // --- LASSO (Refine-style) ---
@@ -11317,25 +11911,20 @@ function fxMouseDown(e) {
     // Check close on first node
     if (fxLassoPoints.length >= 3) {
       const first = fxLassoPoints[0];
-      // First node in screen coords for hit test
-      const fsx = oxBase + fix.x * s + (first.x * drawW - drawW / 2) * Math.cos(rot) * s / drawW * fxImgW;
-      const fsy = oyBase + fix.y * s;
-      // Simple proximity test: reproject first node to screen
-      const fDx = (first.x - 0.5) * drawW;
-      const fDy = (first.y - 0.5) * drawH;
-      const fSx = fDx * Math.cos(rot) - fDy * Math.sin(rot);
-      const fSy = fDx * Math.sin(rot) + fDy * Math.cos(rot);
-      const fsxS = oxBase + (fix.x + fSx / fxImgW) * s;
-      const fsyS = oyBase + (fix.y + fSy / fxImgH) * s;
+      // Reproject first node to screen coords using fxLocalToScreen
+      const fScreen = fxLocalToScreen(first.x, first.y);
+      const fsxS = fScreen.x, fsyS = fScreen.y;
       if ((mx-fsxS)*(mx-fsxS) + (my-fsyS)*(my-fsyS) <= 144) {
         // Close lasso → apply as edit stroke
         fxSaveSnapshot();
         const stroke = { type: 'lasso', mode: fxAction, points: [...fxLassoPoints], radius: 0, feather: fxBrushFeather, flow: fxBrushFlow, local: true };
         if (!fix.editStrokes) fix.editStrokes = [];
         fix.editStrokes.push(stroke);
-        fix._workCanvas = fxBuildWorkCanvas(fix);
+        // Apply directly to existing workCanvas (fast, no rebuild)
+        fxApplyEditStroke(fix._workCanvas.getContext('2d'), stroke, fix._workCanvas.width, fix._workCanvas.height, fix._img);
         fxLassoPoints = [];
-        fxDraw(); fxSaveState();
+        fxDraw();
+        setTimeout(() => fxSaveState(), 0);
         return;
       }
     }
@@ -11349,15 +11938,19 @@ function fxMouseDown(e) {
     }
     fxDraw(); return;
   }
-  // --- BRUSH (Togas-style with feather/flow) ---
+  // --- BRUSH (Togas-style: apply directly to workCanvas in real-time) ---
   fxSaveSnapshot();
   fxDrawing = true;
+  fxLastBrushPt = null;  // Reset for new stroke
+  const brushR = fxBrushSize * (wkW / drawW);
   fxCurStroke = {
     type: 'brush', mode: fxAction,
     points: [{ x: lx, y: ly }],
-    radius: fxBrushSize / Math.max(drawW, drawH),
+    radius: brushR,
     feather: fxBrushFeather, flow: fxBrushFlow, local: true
   };
+  // Apply first point directly to workCanvas (real-time like Togas)
+  fxBrushOnWorkCanvas(fix, lx, ly, brushR);
   fxDraw();
 }
 
@@ -11365,13 +11958,13 @@ function fxMouseMove(e) {
   const rect = fxCanvas.getBoundingClientRect();
   const mx = e.clientX - rect.left, my = e.clientY - rect.top;
 
-  // Cursor
+  // Cursor (neutral white circle)
   if (fxCursorCtx && (fxTool === 'brush' || (fxSubMode && fxTool === 'brush'))) {
     fxCursorCtx.clearRect(0, 0, fxCursorCanvas.width, fxCursorCanvas.height);
     const r = fxBrushSize * pvZoom;
     fxCursorCtx.beginPath();
     fxCursorCtx.arc(mx, my, r, 0, Math.PI * 2);
-    fxCursorCtx.strokeStyle = fxAction === 'erase' ? 'rgba(255,80,80,0.7)' : 'rgba(80,255,80,0.7)';
+    fxCursorCtx.strokeStyle = 'rgba(255,255,255,0.8)';
     fxCursorCtx.lineWidth = 1.5;
     fxCursorCtx.stroke();
   }
@@ -11383,7 +11976,21 @@ function fxMouseMove(e) {
     fxDraw(); return;
   }
 
-  // Sub-editor brush drag
+  // Sub-editor lasso node drag
+  if (fxSubMode && fxSubDraggingNode >= 0 && fxTool === 'lasso') {
+    const rot = fxSubRotation || 0;
+    const swapped = (rot === 90 || rot === 270);
+    const dw = swapped ? fxSubImgH : fxSubImgW;
+    const dh = swapped ? fxSubImgW : fxSubImgH;
+    const s = pvZoom;
+    const ox = (fxCanvas.width - dw * s) / 2 + pvX;
+    const oy = (fxCanvas.height - dh * s) / 2 + pvY;
+    const nx = (mx - ox) / (dw * s), ny = (my - oy) / (dh * s);
+    fxSubLassoPoints[fxSubDraggingNode] = { x: nx, y: ny };
+    fxDraw(); return;
+  }
+
+  // Sub-editor brush drag — apply in real-time
   if (fxSubMode && fxSubDrawing && fxSubCurStroke) {
     const rot = fxSubRotation || 0;
     const swapped = (rot === 90 || rot === 270);
@@ -11394,6 +12001,10 @@ function fxMouseMove(e) {
     const oy = (fxCanvas.height - dh * s) / 2 + pvY;
     const nx = (mx - ox) / (dw * s), ny = (my - oy) / (dh * s);
     fxSubCurStroke.points.push({ x: nx, y: ny });
+    // Apply directly to workCanvas (un-rotate from display to original image space)
+    const wc = fxSubDisplayToPixel(nx, ny);
+    const subBrushR = fxBrushSize * (fxSubImgW / dw);
+    fxSubBrushOnWorkCanvas(wc.x, wc.y, subBrushR);
     fxDraw(); return;
   }
 
@@ -11410,16 +12021,41 @@ function fxMouseMove(e) {
     fx.rotation = Math.round((fxRotating.startRot + delta) * 10) / 10;
     fxDraw(); return;
   }
+  // Pivot dragging
+  if (fxDraggingPivot && fxSelected >= 0) {
+    const fx = fxFixes[fxSelected];
+    const s = pvZoom;
+    const fxS = fx.fxScale || 1.0;
+    const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
+    const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
+    const fcx = oxBase + fx.x * s;
+    const fcy = oyBase + fx.y * s;
+    const fw = (fx.bboxW || fx._workCanvas.width) * fxS * s;
+    const fh = (fx.bboxH || fx._workCanvas.height) * fxS * s;
+    const rad = -(fx.rotation || 0) * Math.PI / 180;
+    const ddx = mx - fcx, ddy = my - fcy;
+    const rx = ddx * Math.cos(rad) - ddy * Math.sin(rad);
+    const ry = ddx * Math.sin(rad) + ddy * Math.cos(rad);
+    fx.pivotX = Math.max(0, Math.min(1, rx / fw + 0.5));
+    fx.pivotY = Math.max(0, Math.min(1, ry / fh + 0.5));
+    fxDraw(); return;
+  }
   if (fxScaling) {
     const fx = fxFixes[fxScaling.idx];
     const s = pvZoom;
     const oxBase = (fxCanvas.width - fxImgW * s) / 2 + pvX;
     const oyBase = (fxCanvas.height - fxImgH * s) / 2 + pvY;
-    const fcx = oxBase + fx.x * s;
-    const fcy = oyBase + fx.y * s;
-    const curDist = Math.hypot(mx - fcx, my - fcy);
+    // Distance from pivot (not center)
+    const curDist = Math.hypot(mx - fxScaling.pivSx, my - fxScaling.pivSy);
     const ratio = curDist / Math.max(1, fxScaling.startDist);
-    fx.fxScale = Math.max(0.1, fxScaling.startScale * ratio);
+    const newScale = Math.max(0.1, fxScaling.startScale * ratio);
+    fx.fxScale = newScale;
+    // Adjust position so pivot stays fixed in base-image space
+    const rotRad = (fx.rotation || 0) * Math.PI / 180;
+    const cosA = Math.cos(rotRad), sinA = Math.sin(rotRad);
+    const plx = fxScaling.pivLocalX, ply = fxScaling.pivLocalY;
+    fx.x = fxScaling.pivBaseX - (plx * newScale * cosA - ply * newScale * sinA);
+    fx.y = fxScaling.pivBaseY - (plx * newScale * sinA + ply * newScale * cosA);
     fxDraw(); return;
   }
   if (fxDragging && !fxDragging.pan) {
@@ -11453,7 +12089,7 @@ function fxMouseMove(e) {
     if (!local) return;
     const last = fxLassoPoints[fxLassoPoints.length - 1];
     const dx = local.x - last.x, dy = local.y - last.y;
-    if (dx*dx + dy*dy > 0.0003) { fxLassoPoints.push({ x: local.x, y: local.y }); fxDraw(); }
+    if (dx*dx + dy*dy > 9) { fxLassoPoints.push({ x: local.x, y: local.y }); fxDraw(); }
     return;
   }
   // Lasso hover cursor
@@ -11468,49 +12104,53 @@ function fxMouseMove(e) {
     // Check node proximity
     if (cursor === 'crosshair') {
       for (const p of fxLassoPoints) {
-        const sx = p.x * fxImgW * s + oxBase, sy = p.y * fxImgH * s + oyBase;
-        if ((mx-sx)*(mx-sx) + (my-sy)*(my-sy) <= 64) { cursor = 'move'; break; }
+        const scr = fxLocalToScreen(p.x, p.y);
+        if ((mx-scr.x)*(mx-scr.x) + (my-scr.y)*(my-scr.y) <= 64) { cursor = 'move'; break; }
       }
     }
     e.target.style.cursor = cursor;
   }
-  // Brush edit drag
-  if (fxDrawing && fxCurStroke) {
-    const s = pvZoom;
+  // Brush edit drag — apply in real-time to workCanvas (like Togas tgBrushOnMask)
+  if (fxDrawing && fxCurStroke && fxSelected >= 0) {
     const local = fxScreenToFixLocal(mx, my);
     if (!local) return;
     fxCurStroke.points.push({ x: local.x, y: local.y });
+    const fix = fxFixes[fxSelected];
+    fxBrushOnWorkCanvas(fix, local.x, local.y, fxCurStroke.radius);
     fxDraw();
   }
 }
 
 function fxMouseUp(e) {
   if (fxDragging && fxDragging.pan) { fxDragging = null; return; }
+  if (fxDraggingPivot) { fxDraggingPivot = false; fxSaveState(); fxDraw(); return; }
   if (fxRotating) { fxRotating = null; fxSaveState(); fxDraw(); return; }
   if (fxScaling) { fxScaling = null; fxSaveState(); fxDraw(); return; }
   if (fxDragging) { fxDragging = null; fxSaveState(); fxDraw(); return; }
 
   // Lasso node drag stop
   if (fxDraggingNode >= 0) { fxDraggingNode = -1; fxDraw(); return; }
+  // Sub-editor lasso node drag stop
+  if (fxSubDraggingNode >= 0) { fxSubDraggingNode = -1; fxDraw(); return; }
   // Lasso freehand stop (keep points, don't close)
   if (fxTool === 'lasso' && fxLassoDownXY) {
     fxLassoDownXY = null; fxLassoFreehand = false;
     fxDraw(); return;
   }
 
-  // Sub-editor brush up
+  // Sub-editor brush up — stroke already applied to workCanvas, just save for server
   if (fxSubMode && fxSubDrawing && fxSubCurStroke) {
     fxSubStrokes.push(fxSubCurStroke);
     fxSubCurStroke = null; fxSubDrawing = false;
     fxDraw(); return;
   }
 
-  // Main brush edit up
+  // Main brush edit up — stroke already applied in real-time, just save for persistence
   if (fxDrawing && fxCurStroke && fxSelected >= 0) {
     const fx = fxFixes[fxSelected];
     if (!fx.editStrokes) fx.editStrokes = [];
     fx.editStrokes.push(fxCurStroke);
-    fx._workCanvas = fxBuildWorkCanvas(fx);
+    fxLastBrushPt = null;
     fxCurStroke = null; fxDrawing = false;
     fxDraw(); fxSaveState();
   }
@@ -11522,7 +12162,7 @@ function fxHitTestLassoNode(e) {
   const mx = e.clientX - rect.left, my = e.clientY - rect.top;
   for (let i = 0; i < fxLassoPoints.length; i++) {
     const scr = fxLocalToScreen(fxLassoPoints[i].x, fxLassoPoints[i].y);
-    if ((mx-scr.x)*(mx-scr.x) + (my-scr.y)*(my-scr.y) <= 64) return i;
+    if ((mx-scr.x)*(mx-scr.x) + (my-scr.y)*(my-scr.y) <= 225) return i;
   }
   return -1;
 }
@@ -11530,7 +12170,11 @@ function fxHitTestLassoNode(e) {
 function fxDblClick(e) {
   // Close lasso in sub-editor
   if (fxSubMode && fxSubLassoPoints.length >= 3) {
-    fxSubStrokes.push({ type: 'lasso', mode: fxAction, points: [...fxSubLassoPoints], radius: 0 });
+    if (!fxSubWorkCanvas) fxSubInitWorkCanvas();
+    fxSubSaveSnapshot();
+    const lassoStroke = { type: 'lasso', mode: fxAction, points: [...fxSubLassoPoints], radius: 0 };
+    fxSubLassoOnWorkCanvas(lassoStroke);
+    fxSubStrokes.push(lassoStroke);
     fxSubLassoPoints = [];
     fxDraw();
     return;
@@ -11538,42 +12182,55 @@ function fxDblClick(e) {
   // Close lasso in main edit mode
   if (!fxSubMode && fxLassoPoints.length >= 3 && fxSelected >= 0) {
     fxSaveSnapshot();
-    const stroke = { type: 'lasso', mode: fxAction, points: [...fxLassoPoints], radius: 0 };
+    const stroke = { type: 'lasso', mode: fxAction, points: [...fxLassoPoints], radius: 0, feather: fxBrushFeather, flow: fxBrushFlow, local: true };
     const fx = fxFixes[fxSelected];
     if (!fx.editStrokes) fx.editStrokes = [];
     fx.editStrokes.push(stroke);
-    fx._workCanvas = fxBuildWorkCanvas(fx);
+    // Apply directly to existing workCanvas (fast, no rebuild)
+    fxApplyEditStroke(fx._workCanvas.getContext('2d'), stroke, fx._workCanvas.width, fx._workCanvas.height, fx._img);
     fxLassoPoints = [];
-    fxDraw(); fxSaveState();
+    fxDraw();
+    setTimeout(() => fxSaveState(), 0);
   }
 }
 
 // --- TIFF Export ---
 async function fxExportTiff() {
-  if (fxFixes.length === 0) {
-    showToast('No hay fixes para exportar. Usa el TIFF de Sombras.', 'warn');
-    return;
-  }
   fxSaveState();
-  showToast('Generando TIFF con fixes...', 'info');
-  // Use sombras export as base, fixes are applied on top
-  // For now, trigger sombras TIFF (which already includes everything except fixes)
-  // TODO: dedicated fixes TIFF endpoint
+  showToast('Generando TIFF con fixes... preparando capas', 'info');
   try {
+    // Build fix layer data: render each fix's workCanvas to base64 PNG
+    const fixData = [];
+    for (const fx of fxFixes) {
+      if (!fx.visible) continue;
+      // Ensure workCanvas is built with all edit strokes applied
+      if (!fx._workCanvas && fx._img) fx._workCanvas = fxBuildWorkCanvas(fx);
+      if (!fx._workCanvas) continue;
+      // Render to base64 PNG (preserves RGBA transparency)
+      const dataUrl = fx._workCanvas.toDataURL('image/png');
+      fixData.push({
+        id: fx.id,
+        imgData: dataUrl,
+        x: fx.x, y: fx.y,
+        rotation: fx.rotation || 0,
+        fxScale: fx.fxScale || 1.0,
+        bboxW: fx.bboxW, bboxH: fx.bboxH,
+        opacity: fx.opacity
+      });
+    }
+    showToast('Enviando al servidor...', 'info');
     const encName = encodeURIComponent(fxFilename);
-    // Load sombras state to include in export
-    let sombrasData = [];
-    try {
-      const sRes = await fetch(`/api/sombras/state/${fxCbtis}/${encName}`);
-      const sd = await sRes.json();
-      sombrasData = sd.polygons || [];
-    } catch {}
-    const res = await fetch(`/api/sombras/export-tiff/${fxCbtis}/${encName}`, {
+    const res = await fetch(`/api/fixes/export-tiff/${fxCbtis}/${encName}`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sombras: sombrasData })
+      body: JSON.stringify({ fixes: fixData })
     });
-    if (!res.ok) { showToast('Error exportando TIFF', 'error'); return; }
+    if (!res.ok) {
+      const errTxt = await res.text();
+      console.error('[FX TIFF] error:', res.status, errTxt);
+      showToast('Error exportando TIFF: ' + res.status, 'error');
+      return;
+    }
     const blob = await res.blob();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -11671,6 +12328,7 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'l' || e.key === 'L') { const btn = document.querySelector('#fxToolbar .rf-btn[onclick*="lasso"]'); if (btn) fxSetTool(btn, 'lasso'); }
     if (e.key === 'r' || e.key === 'R') { fxAction = 'restore'; document.querySelectorAll('#fxToolbar .rf-btn.restore,#fxToolbar .rf-btn.erase').forEach(b => b.classList.remove('active')); const b = document.querySelector('#fxToolbar .rf-btn.restore'); if (b) b.classList.add('active'); }
     if (e.key === 'e' || e.key === 'E') { fxAction = 'erase'; document.querySelectorAll('#fxToolbar .rf-btn.restore,#fxToolbar .rf-btn.erase').forEach(b => b.classList.remove('active')); const b = document.querySelector('#fxToolbar .rf-btn.erase'); if (b) b.classList.add('active'); }
+    if (e.key === 'p' || e.key === 'P') fxTogglePivot();
     if (e.key === 'f' || e.key === 'F') fxToggleFullscreen();
     if (e.key === '0') fxZoomFit();
     if (e.key === '[') { fxBrushSize = Math.max(2, fxBrushSize - 2); const sl = document.querySelector('#fxToolbar .rf-size-slider'); if (sl) sl.value = fxBrushSize; const v = document.getElementById('fxSizeVal'); if (v) v.textContent = fxBrushSize; }
